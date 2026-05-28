@@ -750,8 +750,7 @@ void usbd_init(void)
 
     // Initialize CDC subsystem (for SInput, HID, Switch, KB/Mouse, and CDC-only modes)
     if (output_mode == USB_OUTPUT_MODE_SINPUT || output_mode == USB_OUTPUT_MODE_HID ||
-        output_mode == USB_OUTPUT_MODE_SWITCH || output_mode == USB_OUTPUT_MODE_SWITCH_PRO ||
-        output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE ||
+        output_mode == USB_OUTPUT_MODE_SWITCH || output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE ||
         output_mode == USB_OUTPUT_MODE_CDC) {
         cdc_init();
     }
@@ -811,11 +810,21 @@ void usbd_task(void)
         }
 
         case USB_OUTPUT_MODE_SWITCH_PRO: {
-            // Switch Pro mode: process CDC tasks, delegate to mode interface
-            cdc_task();
+            // Switch Pro mode: delegate to mode interface. The mode's task()
+            // drives the post-handshake 0x30 keepalive stream.
+            //
+            // ORDER MATTERS: repopulate pro_report from the latest input FIRST
+            // (usbd_send_report -> mode->send_report updates pro_report), THEN
+            // run task() which transmits the now-current report. Doing it the
+            // other way round transmits last cycle's input and lets a fresh tap
+            // be overwritten before it is ever sent (the "have to hold the
+            // button" lag). Mirrors GP2040/OGX populate-then-send per cycle.
             const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SWITCH_PRO];
-            if (mode && mode->is_ready && mode->is_ready()) {
-                usbd_send_report(0);
+            if (mode) {
+                if (mode->is_ready && mode->is_ready()) {
+                    usbd_send_report(0);   // refresh pro_report from input
+                }
+                if (mode->task) mode->task();  // transmit current pro_report
             }
             break;
         }
@@ -1102,19 +1111,27 @@ static bool usbd_send_switch_pro_report(uint8_t player_index)
         return false;
     }
 
-    // Check for pending event (event-driven from tap callback)
-    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+    if (player_index >= USB_MAX_PLAYERS) {
         return false;
     }
 
+    // Switch Pro streams a continuous 0x30 report (the mode's task() keepalive),
+    // so the report buffer must always reflect the CURRENT input — not only the
+    // input present on the exact cycle a new event arrived. Unlike the purely
+    // event-driven modes (PS3/PS4), we therefore repopulate from the latest
+    // input state on EVERY call, regardless of pending_flags. pending_events[]
+    // always holds the most recent input (overwritten by the tap callback), so
+    // this mirrors OGX-Mini's per-cycle gamepad_to_switch_report() refresh.
+    // We still clear the flag when set, to keep the event bookkeeping tidy.
+    pending_flags[player_index] = false;
+
     const input_event_t* event = &pending_events[player_index];
-    pending_flags[player_index] = false;  // Clear after consumption
 
     // Apply profile (combos, button remaps)
     profile_output_t profile_out;
     uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
 
-    // Delegate to mode implementation
+    // Delegate to mode implementation (updates pro_report; task() streams it)
     return mode->send_report(player_index, event, &profile_out, processed_buttons);
 }
 
@@ -2103,6 +2120,18 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
         }
     }
 
+    // Switch Pro feature/init reports: the host fetches handshake (0x81) and
+    // subcommand (0x21) replies via GET_REPORT control transfers, not only the
+    // interrupt IN endpoint. Delegate to the mode and return its result (do NOT
+    // fall through to the generic-input default below).
+    if (output_mode == USB_OUTPUT_MODE_SWITCH_PRO) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SWITCH_PRO];
+        if (mode && mode->get_report) {
+            return mode->get_report(report_id, report_type, buffer, reqlen);
+        }
+        return 0;
+    }
+
     // Default: return current input report
     (void)report_id;
     (void)report_type;
@@ -2121,8 +2150,10 @@ __attribute__((weak)) void app_on_console_shutdown(void)
 
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
 {
-    printf("[usbd] set_report_cb: itf=%d report_id=0x%02x type=%d len=%d mode=%d\n",
-           itf, report_id, report_type, bufsize, output_mode);
+    // TEMP DEBUG: silenced — the Switch Pro handler logs the interesting events
+    // itself (and throttles the 0x80 0x04 flood). Re-enable if needed.
+    // printf("[usbd] set_report_cb: itf=%d report_id=0x%02x type=%d len=%d mode=%d\n",
+    //        itf, report_id, report_type, bufsize, output_mode);
 
     // SInput/KB/Mouse composite: route by interface
     if (output_mode == USB_OUTPUT_MODE_SINPUT ||
