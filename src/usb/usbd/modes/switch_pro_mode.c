@@ -23,7 +23,7 @@
 #include "../usbd.h"
 #include "descriptors/switch_pro_descriptors.h"
 #include "core/buttons.h"
-#include "platform/platform.h"   // platform_time_us(), platform_get_unique_id()
+#include "platform/platform.h"   // platform_get_unique_id()
 #include <string.h>
 
 
@@ -543,21 +543,6 @@ static void switch_pro_mode_task(void)
 {
     if (!tud_hid_ready()) return;
 
-    // TEMP DIAGNOSTIC: once/sec, report handshake state + current pro_report
-    // buttons, UNCONDITIONALLY (before any gate). Tells us whether the issue is
-    // (a) handshake not completing, or (b) pro_report not being updated.
-    {
-        static uint32_t last_diag = 0;
-        uint32_t tnow = platform_time_us();
-        if ((tnow - last_diag) > 1000000) {
-            last_diag = tnow;
-            const uint8_t* b = (const uint8_t*)&pro_report;
-            printf("[swpro] DIAG hs_done=%d ready=%d btn=%02x %02x %02x\n",
-                   pro_handshake_done, (int)(switch_pro_handshake_complete()),
-                   b[3], b[4], b[5]);
-        }
-    }
-
     // Unprompted IDENTIFY once at startup (mirrors GP2040-CE). Seeds the host's
     // handshake; some hosts (Windows) won't read the input stream until they've
     // seen the controller identity, and may never send 0x80 0x01 themselves.
@@ -574,7 +559,6 @@ static void switch_pro_mode_task(void)
         // bytes). Passing 0 with the ID in the buffer mis-frames the report.
         if (tud_hid_report(0, ident, 64)) {
             pro_identify_sent = true;
-            printf("[swpro] >>> sent unprompted IDENTIFY (81 01)\n");
         }
         return;  // take the slot this cycle
     }
@@ -582,23 +566,14 @@ static void switch_pro_mode_task(void)
     // No artificial pacing: tud_hid_report() only succeeds when the IN endpoint
     // is free (the host has collected the previous report), so sends are
     // naturally rate-limited by the host's poll interval. OGX-Mini runs unpaced
-    // this way. An earlier 5ms gate was tried during handshake debugging but was
-    // not the fix and only added input latency, so it has been removed.
-    static uint32_t last_send_us = 0;
-    uint32_t now = platform_time_us();
-    (void)last_send_us;
+    // this way.
 
     // Priority 1: flush one queued handshake/subcommand reply per send window.
     if (!pro_reply_ring_empty()) {
         pro_reply_t* e = &pro_reply_ring[pro_reply_tail];
         // Descriptor declares report IDs: pass the real ID as the param and the
         // payload after byte 0 (TinyUSB prepends the ID on the wire).
-        bool ok = tud_hid_report(0, e->data, e->len);
-        if (ok) {
-            last_send_us = now;
-            // TEMP DEBUG: log what we just sent (report id, ack@13, subcmd@14).
-            printf("[swpro] <<< reply id=%02x ack=%02x sub=%02x len=%u\n",
-                   e->data[0], e->data[13], e->data[14], (unsigned)e->len);
+        if (tud_hid_report(0, e->data, e->len)) {
             pro_reply_tail = (uint8_t)((pro_reply_tail + 1) % PRO_REPLY_RING);
         }
         return;  // one report per send window; reply takes the slot
@@ -619,17 +594,7 @@ static void switch_pro_mode_task(void)
     uint8_t out64[64];
     memset(out64, 0, sizeof(out64));
     memcpy(out64, &pro_report, sizeof(pro_report));  // 49 bytes, rest zero
-    bool ok = tud_hid_report(0, out64, sizeof(out64));
-    if (ok) last_send_us = now;
-
-    // TEMP DEBUG: log whenever the button bytes CHANGE (not on a timer), so we
-    // can confirm every button maps through.
-    static uint8_t last_b[3] = {0xAA, 0xAA, 0xAA};
-    const uint8_t* b = (const uint8_t*)&pro_report;
-    if (b[3] != last_b[0] || b[4] != last_b[1] || b[5] != last_b[2]) {
-        last_b[0] = b[3]; last_b[1] = b[4]; last_b[2] = b[5];
-        printf("[swpro] btn change: %02x %02x %02x  ok=%d\n", b[3], b[4], b[5], ok);
-    }
+    tud_hid_report(0, out64, sizeof(out64));
 }
 
 // --- Host output (rumble / subcommands) -----------------------------------
@@ -641,32 +606,6 @@ static void switch_pro_mode_handle_output(uint8_t report_id,
 {
     uint8_t response[64];
     uint16_t resp_len = 0;
-
-    // TEMP DEBUG: The host floods 0x80 0x04 (disable-timeout) endlessly, which
-    // drowns the log. Suppress that specific message (just count it, print once
-    // per second), but print EVERY other host message in full — those are the
-    // interesting ones (identify, handshake, baud, subcommands, rumble).
-    {
-        uint8_t b0 = (len > 0) ? data[0] : 0xFF;
-        uint8_t b1 = (len > 1) ? data[1] : 0xFF;
-        bool is_80_04 = (b0 == 0x80 && b1 == 0x04);
-        static uint32_t spam_count = 0;
-        static uint32_t last_spam_print_us = 0;
-        if (is_80_04) {
-            spam_count++;
-            uint32_t now = platform_time_us();
-            if ((now - last_spam_print_us) > 1000000) {
-                last_spam_print_us = now;
-                printf("[swpro] (x%lu) host still sending 80 04; handshake_done=%d identify_sent=%d\n",
-                       (unsigned long)spam_count, pro_handshake_done, pro_identify_sent);
-                spam_count = 0;
-            }
-        } else {
-            printf("[swpro] OUT id=%02x len=%u : ", report_id, (unsigned)len);
-            for (uint16_t i = 0; i < len && i < 20; i++) printf("%02x ", data[i]);
-            printf("\n");
-        }
-    }
 
     // Let the protocol state machine handle handshake/subcommands.
     if (switch_pro_protocol_handle_output(report_id, data, len, response, &resp_len)) {
@@ -737,8 +676,6 @@ static uint16_t switch_pro_mode_get_report(uint8_t report_id,
             uint16_t n = (reqlen < e->len) ? reqlen : e->len;
             memcpy(buffer, e->data, n);
             pro_reply_tail = (uint8_t)((pro_reply_tail + 1) % PRO_REPLY_RING);
-            printf("[swpro] GET_REPORT served id=%02x (req %02x) len=%u\n",
-                   e->data[0], report_id, (unsigned)n);
             return n;
         }
     }
