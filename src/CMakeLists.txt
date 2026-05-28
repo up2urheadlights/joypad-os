@@ -628,14 +628,19 @@ add_executable(joypad_dc)
 # WORKAROUND: KB2040 + Core-1 TX hits an enumeration-dropoff bug we haven't
 # root-caused (works fine on RP2040 Zero where gill validated the PR).
 # Mirror n642dc's Core-0 TX config until the underlying issue is diagnosed.
-# VMU sources intentionally not linked — vmu_ram is 128KB BSS which would
-# leave KB2040 + BTstack with too little headroom for stack/USB buffers.
-# USB MSC + VMU storage on KB2040 will land as a follow-up once the dropoff
-# is fixed and we have a real flash drive to test with.
-target_compile_definitions(joypad_dc PRIVATE CONFIG_DC=1 CONFIG_USB_HOST=1 CONFIG_NO_NEOPIXEL=1)
+# VMU is enabled (RAM-only — no CONFIG_SD): the 128KB vmu_ram fits the same
+# as the RP2040-Zero build (identical RP2040, identical BTstack linkage,
+# ~247KB BSS / ~16KB headroom). Persistence backend (USB MSC flash drive or
+# an onboard QSPI partition) is a follow-up; vmu_sd.c compiles to a no-op
+# without CONFIG_SD so a fresh card just reverts to the preformat default
+# (with ICONDATA) each boot.
+target_compile_definitions(joypad_dc PRIVATE CONFIG_DC=1 CONFIG_USB_HOST=1 CONFIG_NO_NEOPIXEL=1 CONFIG_VMU=1 CONFIG_VMU_QSPI=1)
 target_sources(joypad_dc PUBLIC ${COMMON_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/dreamcast_device.c
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/maple_state_machine.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/vmu.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/vmu_sd.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/vmu_storage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2dc/app.c
 )
 target_include_directories(joypad_dc PUBLIC
@@ -669,6 +674,7 @@ target_sources(joypad_dc_rp2040zero PUBLIC ${COMMON_SOURCES} ${SD_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/maple_state_machine.c
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/vmu.c
     ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/vmu_sd.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/vmu_storage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/apps/usb2dc/app.c
 )
 target_include_directories(joypad_dc_rp2040zero PUBLIC

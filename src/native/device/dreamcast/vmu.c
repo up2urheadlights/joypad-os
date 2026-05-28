@@ -3,6 +3,7 @@
 
 #include "vmu.h"
 #include "vmu_sd.h"
+#include "vmu_storage.h"
 #include "vmu_default_icondata.h"
 #include "dreamcast_device.h"
 #include "pico/stdlib.h"
@@ -205,11 +206,12 @@ void vmu_init(uint8_t port_addr) {
     printf("[VMU] Initialized (SD load deferred)\n");
 }
 
-// Called after controller enumerates with DC — loads saved VMU from SD
-// Separated from vmu_init() to avoid blocking Maple Bus enumeration
+// Called after controller enumerates with DC — selects a persistence backend
+// (USB flash > SD > QSPI > RAM) and loads any saved image. Deferred from
+// vmu_init() to avoid blocking Maple Bus enumeration.
 void vmu_sd_load(void) {
-    vmu_sd_init();
-    printf("[VMU] SD load complete\n");
+    vmu_storage_init();
+    printf("[VMU] Storage load complete\n");
 }
 
 void vmu_set_slot(uint8_t slot)  { (void)slot; }
@@ -261,6 +263,6 @@ void __not_in_flash_func(vmu_handle_write_complete)(void) {
 }
 
 void vmu_task(void) {
-    // Flush dirty VMU RAM to SD card when writeback timer expires
-    vmu_sd_task();
+    // Flush dirty VMU RAM to the active backend when its writeback timer expires
+    vmu_storage_task();
 }
