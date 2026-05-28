@@ -88,6 +88,95 @@ static uint16_t stick8_to_12(uint8_t v)
     return (uint16_t)(((uint32_t)v * SWITCH_PRO_STICK_MAX) / 255U);
 }
 
+// --- IMU (motion) conversion -------------------------------------------------
+// Target: the Switch Pro's native LSM6DS3 raw scale (dekuNukem public RE docs):
+//   Accel: full-scale +/-8g,  ~4096 LSB = 1g
+//   Gyro:  full-scale +/-2000 dps, ~14.3 LSB = 1 dps (208Hz/2000dps default)
+// Source: joypad-os neutral motion (event->accel/gyro) at the device's own
+//   full-scale range, given by event->accel_range (milli-g) and gyro_range (dps).
+//   e.g. DualSense: accel +/-4g (range 4000), gyro +/-2000 dps (range 2000).
+//
+// Conversion is range-aware so any motion source maps correctly:
+//   switch_raw = src_raw * (src_full_scale / SWITCH_full_scale)
+// because a larger source full-scale packs fewer LSB per physical unit, and the
+// Switch's wider/narrower full-scale must be matched. Worked example (DualSense):
+//   accel +/-4g -> +/-8g : multiply by 4/8 = 0.5
+//   gyro  +/-2000 -> +/-2000 : multiply by 1.0 (pass-through)
+#define SWPRO_ACCEL_FS_G      8      // Switch accel full-scale, g
+#define SWPRO_GYRO_FS_DPS     2000   // Switch gyro full-scale, dps
+
+static int16_t imu_scale(int16_t src_raw, uint16_t src_fs, uint16_t dst_fs)
+{
+    if (dst_fs == 0) return 0;
+    int32_t v = ((int32_t)src_raw * (int32_t)src_fs) / (int32_t)dst_fs;
+    if (v >  32767) v =  32767;
+    if (v < -32768) v = -32768;
+    return (int16_t)v;
+}
+
+// AXIS MAPPING (TUNABLE — confirm empirically in Citron):
+// DualSense gyro is documented (ds5_bt.c) as [0]=X(pitch) [1]=Y(yaw) [2]=Z(roll).
+// The known trouble spot (per joycon2cpp issue #44) is YAW<->ROLL swap and a YAW
+// sign flip; PITCH is almost always correct. The macros below make the swap and
+// each sign a one-line change. If motion is wrong when testing:
+//   - horizontal pointer mirrored  -> flip SWPRO_GYRO_SIGN_YAW
+//   - twist vs turn swapped         -> swap SWPRO_GYRO_SRC_YAW / _ROLL
+//   - vertical mirrored             -> flip SWPRO_GYRO_SIGN_PITCH
+// Accel axes follow the same source order; adjust signs if "up" reads wrong.
+// Axis mapping locked to REAL Pro Controller hardware. A genuine Pro was paired
+// as input (switch_pro_bt.c IMU parsing) and its native gyro/accel captured in 6
+// gravity poses + 6 rotations via UART. Confirmed Pro native frame:
+//   Pro +X = toward top edge (away from user), +Y = toward left, +Z = up (out of face)
+// DualSense raw frame (measured): +X=right, +Y=up, +Z=toward user. Matching physical
+// directions gives the DualSense->Pro transform below, applied identically to gyro
+// and accel so both share the Pro's frame (fixes fusion games like MK8D):
+//   Pro X = -DS_z,  Pro Y = -DS_x,  Pro Z = +DS_y
+// gyro slots gyro_1/2/3 = rotation about Pro X/Y/Z.
+#define SWPRO_GYRO_SRC_PITCH  2      // gyro_1 (Pro X) = -DS_z
+#define SWPRO_GYRO_SRC_YAW    0      // gyro_2 (Pro Y) = -DS_x
+#define SWPRO_GYRO_SRC_ROLL   1      // gyro_3 (Pro Z) = +DS_y
+#define SWPRO_GYRO_SIGN_PITCH (-1)
+#define SWPRO_GYRO_SIGN_YAW   (-1)
+#define SWPRO_GYRO_SIGN_ROLL  (+1)
+#define SWPRO_ACCEL_SRC_X     2      // accel Pro X = -DS_z
+#define SWPRO_ACCEL_SRC_Y     0      // accel Pro Y = -DS_x
+#define SWPRO_ACCEL_SRC_Z     1      // accel Pro Z = +DS_y
+#define SWPRO_ACCEL_SIGN_X    (-1)
+#define SWPRO_ACCEL_SIGN_Y    (-1)
+#define SWPRO_ACCEL_SIGN_Z    (+1)
+
+static inline void put_i16le(uint8_t* p, int16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+// Pack one 12-byte IMU frame: accel XYZ then gyro (pitch,yaw,roll), int16 LE.
+// Switch 0x30 carries 3 such frames (5ms apart); we fill all three with the
+// current sample (no interpolation in v1 — adequate for emulator/PC use).
+static void pack_imu_frame(uint8_t out[12], const input_event_t* ev)
+{
+    uint16_t a_fs = ev->accel_range ? ev->accel_range : 4000;  // milli-g
+    uint16_t g_fs = ev->gyro_range  ? ev->gyro_range  : 2000;  // dps
+    uint16_t a_fs_g = (uint16_t)(a_fs / 1000);                 // -> g
+    if (a_fs_g == 0) a_fs_g = 4;
+
+    int16_t ax = imu_scale((int16_t)(SWPRO_ACCEL_SIGN_X * ev->accel[SWPRO_ACCEL_SRC_X]), a_fs_g, SWPRO_ACCEL_FS_G);
+    int16_t ay = imu_scale((int16_t)(SWPRO_ACCEL_SIGN_Y * ev->accel[SWPRO_ACCEL_SRC_Y]), a_fs_g, SWPRO_ACCEL_FS_G);
+    int16_t az = imu_scale((int16_t)(SWPRO_ACCEL_SIGN_Z * ev->accel[SWPRO_ACCEL_SRC_Z]), a_fs_g, SWPRO_ACCEL_FS_G);
+
+    int16_t gp = imu_scale((int16_t)(SWPRO_GYRO_SIGN_PITCH * ev->gyro[SWPRO_GYRO_SRC_PITCH]), g_fs, SWPRO_GYRO_FS_DPS);
+    int16_t gy = imu_scale((int16_t)(SWPRO_GYRO_SIGN_YAW   * ev->gyro[SWPRO_GYRO_SRC_YAW]),   g_fs, SWPRO_GYRO_FS_DPS);
+    int16_t gr = imu_scale((int16_t)(SWPRO_GYRO_SIGN_ROLL  * ev->gyro[SWPRO_GYRO_SRC_ROLL]),  g_fs, SWPRO_GYRO_FS_DPS);
+
+    put_i16le(out + 0, ax);
+    put_i16le(out + 2, ay);
+    put_i16le(out + 4, az);
+    put_i16le(out + 6, gp);
+    put_i16le(out + 8, gy);
+    put_i16le(out + 10, gr);
+}
+
 // ============================================================================
 // PROTOCOL STATE MACHINE
 // Pro Controller handshake / subcommand handling.
@@ -516,16 +605,20 @@ static bool switch_pro_mode_send_report(uint8_t player_index,
     pro_report.timer = report_timer++;
 
     // --- IMU --------------------------------------------------------
-    // TODO: populate pro_report.imu[36] from joypad-os neutral motion.
-    // Pattern mirrors sinput_mode.c:
-    //     if (event->has_motion) { use event->gyro[0..2], event->accel[0..2];
-    //         convert from event->gyro_range/accel_range to Pro IMU scale;
-    //         write 3 identical frames (or interpolate) into pro_report.imu }
-    //     else { memset(pro_report.imu, 0, sizeof(pro_report.imu)); }
-    // Test plan: pair a DS5 (already parsed into event->gyro/accel) and verify
-    // gyro appears in Citron's direct Pro driver / on hardwaretester.com.
-    (void)event;
-    memset(pro_report.imu, 0, sizeof(pro_report.imu));  // placeholder
+    // A genuine Pro Controller streams motion only after the host enables the
+    // IMU via subcommand 0x40 (tracked in pro_imu_enabled). The host's enable
+    // step also performs a zero-rate calibration, so gating here matches real
+    // hardware behavior. Populate 3 frames from the current motion sample when
+    // enabled and available; otherwise zero the region.
+    if (pro_imu_enabled && event->has_motion) {
+        uint8_t frame[12];
+        pack_imu_frame(frame, event);
+        memcpy(pro_report.imu + 0,  frame, 12);
+        memcpy(pro_report.imu + 12, frame, 12);
+        memcpy(pro_report.imu + 24, frame, 12);
+    } else {
+        memset(pro_report.imu, 0, sizeof(pro_report.imu));
+    }
 
     // NOTE: do NOT send here. task() is the single point that writes to the IN
     // endpoint (to avoid collisions with handshake replies / keepalive). This
