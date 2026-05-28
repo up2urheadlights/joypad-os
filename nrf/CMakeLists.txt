@@ -70,6 +70,7 @@ set(SRCS
     "${SHARED_SRC}/usb/usbd/modes/sinput_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xinput_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/switch_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/switch_pro_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/ps3_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/psclassic_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/pcemini_mode.c"
