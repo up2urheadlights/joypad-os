@@ -23,7 +23,7 @@
 #include "../usbd.h"
 #include "descriptors/switch_pro_descriptors.h"
 #include "core/buttons.h"
-#include "platform/platform.h"   // platform_time_us(), platform_random()
+#include "platform/platform.h"   // platform_time_us(), platform_get_unique_id()
 #include <string.h>
 
 
@@ -57,37 +57,312 @@ static uint16_t stick8_to_12(uint8_t v)
 }
 
 // ============================================================================
-// PROTOCOL STATE MACHINE  (stub — to be implemented from
-// GP2040-CE SwitchProDriver.cpp (MIT) + dekuNukem public docs).
-// Kept file-local (static) for now; refactor to its
-// own file.
+// PROTOCOL STATE MACHINE
+// Pro Controller handshake / subcommand handling.
+// Adapted from GP2040-CE SwitchProDriver.cpp (MIT) for the protocol structure,
+// with SPI calibration values from dekuNukem public docs (spi_flash_notes.md).
 // ============================================================================
+
+// --- Handshake/protocol state (reset in init) ---
+static bool     pro_imu_enabled       = false;
+static bool     pro_vibration_enabled = false;
+static bool     pro_handshake_done    = false;  // host completed USB init
+static uint8_t  pro_player_leds       = 0;
+static uint8_t  pro_input_mode        = 0x30;   // default full input report mode
+static uint8_t  pro_reply_counter     = 0;
+
+// Emulated MAC address (reversed on the wire). Randomized at init.
+static uint8_t  pro_mac[6] = {0x7c, 0xbb, 0x8a, 0x00, 0x00, 0x00};
+
+// Device-info reply body (REQUEST_DEVICE_INFO 0x02).
+// Layout per dekuNukem docs: fw major/minor, controller type (0x03 = Pro),
+// unknown(0x02), MAC[6] (big-endian on wire), unknown(0x01), colors-stored(0x02).
+static const uint8_t PRO_FW_MAJOR = 0x04;
+static const uint8_t PRO_FW_MINOR = 0x91;
+static const uint8_t PRO_CONTROLLER_TYPE = 0x03;  // Pro Controller
+
+// --- SPI flash calibration data (dekuNukem spi_flash_notes.md, public) ---
+// Factory stick calibration block, returned for reads at 0x603D.
+// Values are dekuNukem's documented factory defaults.
+static const uint8_t PRO_SPI_FACTORY_STICK[] = {
+    0xBA, 0x15, 0x62, 0x11, 0xB8, 0x7F, 0x29, 0x06, 0x5B,
+    0xFF, 0xE7, 0x7E, 0x0E, 0x36, 0x56, 0x9E, 0x85, 0x60, 0xFF
+};
+// Factory IMU (motion) calibration block, returned for reads at 0x6020.
+static const uint8_t PRO_SPI_FACTORY_IMU[] = {
+    0x50, 0xFD, 0x00, 0x00, 0xC6, 0x0F, 0x0F, 0x30, 0x61,
+    0xAE, 0x90, 0xD9, 0xD4, 0x14, 0x54, 0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63
+};
+// Stick device parameters, returned for reads at 0x6086 / 0x6098.
+static const uint8_t PRO_SPI_STICK_PARAMS[] = {
+    0x0F, 0x30, 0x61, 0x96, 0x30, 0xF3, 0xD4, 0x14, 0x54, 0x41,
+    0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63
+};
+// User calibration region at 0x8010/0x8026 — return 0xFF (no user cal = use factory).
+
+// Fill `dest` (size bytes) with the SPI flash contents at `addr`.
+// Returns the documented data for known calibration addresses; 0xFF otherwise.
+static void pro_spi_read(uint8_t* dest, uint32_t addr, uint8_t size)
+{
+    memset(dest, 0xFF, size);  // default: erased flash
+    switch (addr) {
+        case 0x6020:  // factory IMU calibration
+            memcpy(dest, PRO_SPI_FACTORY_IMU,
+                   size < sizeof(PRO_SPI_FACTORY_IMU) ? size : sizeof(PRO_SPI_FACTORY_IMU));
+            break;
+        case 0x603D:  // factory stick calibration
+            memcpy(dest, PRO_SPI_FACTORY_STICK,
+                   size < sizeof(PRO_SPI_FACTORY_STICK) ? size : sizeof(PRO_SPI_FACTORY_STICK));
+            break;
+        case 0x6086:  // left stick device parameters
+        case 0x6098:  // right stick device parameters
+            memcpy(dest, PRO_SPI_STICK_PARAMS,
+                   size < sizeof(PRO_SPI_STICK_PARAMS) ? size : sizeof(PRO_SPI_STICK_PARAMS));
+            break;
+        case 0x6050:  // controller color (body/buttons/grips) — return neutral grey
+            if (size >= 12) {
+                static const uint8_t colors[12] = {
+                    0x32, 0x32, 0x32,  0xFF, 0xFF, 0xFF,
+                    0x46, 0x46, 0x46,  0x46, 0x46, 0x46
+                };
+                memcpy(dest, colors, 12);
+            }
+            break;
+        default:
+            break;  // unknown address: leave as 0xFF
+    }
+}
+
+// Build the common 0x21 subcommand-reply preamble into `r`.
+// r[0]=0x21, r[1]=counter, r[2]=battery/conn, r[3..11]=neutral input snapshot,
+// r[12]=0x00. The subcommand-specific bytes start at r[13].
+static void pro_build_2110_preamble(uint8_t* r)
+{
+    memset(r, 0, 64);
+    r[0]  = 0x21;
+    r[1]  = pro_reply_counter++;
+    r[2]  = 0x90;       // battery full + USB powered
+    // r[3..11] left as neutral input (sticks centered handled host-side via cal)
+    r[3]  = 0x00; r[4] = 0x00; r[5] = 0x00;  // buttons
+    // centered sticks (0x800 packed)
+    r[6]  = 0x00; r[7] = 0x08; r[8] = 0x80;
+    r[9]  = 0x00; r[10] = 0x08; r[11] = 0x80;
+    r[12] = 0x00;       // vibrator input report
+}
 
 static void switch_pro_protocol_init(void)
 {
-    // TODO: reset handshake state machine, IMU-enable flag, vibration flag,
-    // player count, SPI calibration cache, MAC, etc.
+    pro_imu_enabled       = false;
+    pro_vibration_enabled = false;
+    pro_handshake_done    = false;
+    pro_player_leds       = 0;
+    pro_input_mode        = 0x30;
+    pro_reply_counter     = 0;
+    // Derive the low 3 MAC bytes from the board's unique ID so multiple
+    // dongles don't collide, and the address is stable across reboots.
+    uint8_t uid[8] = {0};
+    platform_get_unique_id(uid, sizeof(uid));
+    pro_mac[3] = uid[5];
+    pro_mac[4] = uid[6];
+    pro_mac[5] = uid[7];
 }
 
-// Returns true if the report was a handshake/subcommand the protocol layer
-// handled (and optionally produced a response in out_response/out_len).
-// Returns false if it's not a protocol report (e.g. pure rumble), so the
-// caller can route it to rumble decode.
+bool switch_pro_handshake_complete(void)
+{
+    return pro_handshake_done;
+}
+
+bool switch_pro_imu_is_enabled(void)
+{
+    return pro_imu_enabled;
+}
+
+// Handle a host OUT report. Returns true if it was a handshake/subcommand the
+// protocol layer consumed (response written to out_response/out_len). Returns
+// false for pure-rumble reports so the caller can route them to rumble decode.
+//
+// Report-ID handling: the Switch report IDs (0x80/0x01/0x10) are declared as
+// OUTPUT report IDs in our HID descriptor, so TinyUSB delivers them in the
+// `report_id` argument with `data` pointing at the payload that follows. To be
+// robust against stacks that instead leave the ID in the buffer, we normalize:
+// if report_id is one of ours, the payload is `data`; otherwise the ID is the
+// first payload byte. We then index payload bytes from a common base.
 static bool switch_pro_protocol_handle_output(uint8_t report_id,
                                               const uint8_t* data, uint16_t len,
                                               uint8_t* out_response, uint16_t* out_len)
 {
-    (void)report_id; (void)data; (void)len;
-    (void)out_response;
     *out_len = 0;
+    if (len < 1 && report_id == 0) return false;
 
-    // TODO: implement
-    //   - 0x80 IDENTIFY/HANDSHAKE/BAUD_RATE/timeout (USB handshake)
-    //   - 0x01 subcommands: REQ_DEVICE_INFO, SPI_READ (calibration),
-    //     SET_MODE, TOGGLE_IMU (0x40), ENABLE_VIBRATION (0x48),
-    //     SET_PLAYER_LIGHTS, SET_NFC_IR_* (stub-ACK), etc.
-    //   - all replying with the 0x21 subcommand-reply / 0x81 USB-reply formats
-    //     and the 0x80-ACK byte conventions (dekuNukem docs).
+    uint8_t sw_report_id;
+    const uint8_t* p;   // payload pointer: p[0] is the first byte AFTER the report ID
+    uint16_t plen;      // length of payload at p
+
+    if (report_id == SWPRO_REPORT_CONFIG_80 ||
+        report_id == SWPRO_REPORT_FEATURE  ||
+        report_id == SWPRO_REPORT_OUTPUT_10) {
+        // ID was stripped into report_id; data is the payload.
+        sw_report_id = report_id;
+        p = data;
+        plen = len;
+    } else {
+        // ID is in the buffer; payload starts at data[1].
+        sw_report_id = data[0];
+        p = data + 1;
+        plen = (len > 0) ? (len - 1) : 0;
+    }
+
+    // --- 0x80 family: USB handshake/config ---
+    if (sw_report_id == SWPRO_REPORT_CONFIG_80) {
+        if (plen < 1) return false;
+        uint8_t subtype = p[0];
+        uint8_t* r = out_response;
+        memset(r, 0, 64);
+        switch (subtype) {
+            case SWPRO_USB_IDENTIFY:           // 0x01: report identity + MAC
+                r[0] = SWPRO_REPORT_USB_IN_81;
+                r[1] = SWPRO_USB_IDENTIFY;
+                r[2] = 0x00;
+                r[3] = PRO_CONTROLLER_TYPE;
+                for (uint8_t i = 0; i < 6; i++) r[4 + i] = pro_mac[5 - i];
+                *out_len = 64;
+                return true;
+            case SWPRO_USB_HANDSHAKE:          // 0x02
+                r[0] = SWPRO_REPORT_USB_IN_81;
+                r[1] = SWPRO_USB_HANDSHAKE;
+                *out_len = 64;
+                return true;
+            case SWPRO_USB_BAUD_RATE:          // 0x03
+                r[0] = SWPRO_REPORT_USB_IN_81;
+                r[1] = SWPRO_USB_BAUD_RATE;
+                *out_len = 64;
+                return true;
+            case SWPRO_USB_DISABLE_USB_TIMEOUT:  // 0x04: host hands over — ready
+                pro_handshake_done = true;
+                return false;  // no reply; switch to streaming 0x30 reports
+            case SWPRO_USB_ENABLE_USB_TIMEOUT:   // 0x05
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    // --- 0x01 family: rumble + subcommand ---
+    // Payload layout (p, past report ID): [counter][rumble:8][subcmd][args...]
+    //   p[0]      = counter
+    //   p[1..8]   = rumble data (4 bytes per motor)
+    //   p[9]      = subcommand id
+    //   p[10..]   = subcommand arguments
+    if (sw_report_id == SWPRO_REPORT_FEATURE) {
+        if (plen < 10) return false;
+        uint8_t subcmd = p[9];
+        uint8_t* r = out_response;
+        pro_build_2110_preamble(r);
+
+        switch (subcmd) {
+            case SWPRO_CMD_REQ_DEVICE_INFO: {   // 0x02
+                r[13] = 0x82;
+                r[14] = SWPRO_CMD_REQ_DEVICE_INFO;
+                r[15] = PRO_FW_MAJOR;
+                r[16] = PRO_FW_MINOR;
+                r[17] = PRO_CONTROLLER_TYPE;
+                r[18] = 0x02;
+                for (uint8_t i = 0; i < 6; i++) r[19 + i] = pro_mac[i];
+                r[25] = 0x01;
+                r[26] = 0x02;
+                *out_len = 64;
+                return true;
+            }
+            case SWPRO_CMD_SET_MODE:            // 0x03
+                pro_input_mode = p[10];
+                r[13] = 0x80;
+                r[14] = SWPRO_CMD_SET_MODE;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_TRIGGER_BUTTONS:     // 0x04
+                r[13] = 0x83;
+                r[14] = SWPRO_CMD_TRIGGER_BUTTONS;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_SET_SHIPMENT:        // 0x08
+                r[13] = 0x80;
+                r[14] = SWPRO_CMD_SET_SHIPMENT;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_SPI_READ: {          // 0x10
+                uint32_t spi_addr = (uint32_t)p[10] |
+                                    ((uint32_t)p[11] << 8) |
+                                    ((uint32_t)p[12] << 16) |
+                                    ((uint32_t)p[13] << 24);
+                uint8_t  spi_size = p[14];
+                if (spi_size > 0x1D) spi_size = 0x1D;
+                r[13] = 0x90;
+                r[14] = SWPRO_CMD_SPI_READ;
+                r[15] = p[10]; r[16] = p[11];   // echo address
+                r[17] = p[12]; r[18] = p[13];
+                r[19] = spi_size;
+                pro_spi_read(&r[20], spi_addr, spi_size);
+                *out_len = 64;
+                return true;
+            }
+            case SWPRO_CMD_SET_NFC_IR_CONFIG:   // 0x21 — stub-ACK (no NFC yet)
+            case SWPRO_CMD_SET_NFC_IR_STATE:    // 0x22 — stub-ACK
+                r[13] = 0x80;
+                r[14] = subcmd;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_SET_PLAYER_LIGHTS:   // 0x30
+                pro_player_leds = p[10];
+                r[13] = 0x80;
+                r[14] = SWPRO_CMD_SET_PLAYER_LIGHTS;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_GET_PLAYER_LIGHTS:   // 0x31
+                r[13] = 0xB0;
+                r[14] = SWPRO_CMD_GET_PLAYER_LIGHTS;
+                r[15] = pro_player_leds;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_SET_HOME_LIGHT:      // 0x38
+                r[13] = 0x80;
+                r[14] = SWPRO_CMD_SET_HOME_LIGHT;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_TOGGLE_IMU:          // 0x40
+                pro_imu_enabled = (p[10] != 0);
+                r[13] = 0x80;
+                r[14] = SWPRO_CMD_TOGGLE_IMU;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_IMU_SENSITIVITY:     // 0x41
+                r[13] = 0x80;
+                r[14] = SWPRO_CMD_IMU_SENSITIVITY;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_ENABLE_VIBRATION:    // 0x48
+                pro_vibration_enabled = (p[10] != 0);
+                r[13] = 0x80;
+                r[14] = SWPRO_CMD_ENABLE_VIBRATION;
+                *out_len = 64;
+                return true;
+            case SWPRO_CMD_GET_VOLTAGE:         // 0x50
+                r[13] = 0xD0;
+                r[14] = SWPRO_CMD_GET_VOLTAGE;
+                r[15] = 0x83;  // ~4.1V (full)
+                r[16] = 0x06;
+                *out_len = 64;
+                return true;
+            default:
+                // Unknown subcommand: generic ACK so the host doesn't stall.
+                r[13] = 0x80;
+                r[14] = subcmd;
+                r[15] = 0x03;
+                *out_len = 64;
+                return true;
+        }
+    }
+
+    // 0x10 (rumble-only) and anything else: not a protocol report.
     return false;
 }
 
@@ -113,7 +388,10 @@ static void switch_pro_mode_init(void)
 
 static bool switch_pro_mode_is_ready(void)
 {
-    return tud_hid_ready();
+    // Only stream 0x30 input reports once the USB handshake is complete.
+    // Before that, the host drives the conversation via OUT reports and we
+    // reply through handle_output(); streaming early can desync some hosts.
+    return tud_hid_ready() && switch_pro_handshake_complete();
 }
 
 static bool switch_pro_mode_send_report(uint8_t player_index,

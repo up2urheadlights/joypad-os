@@ -2184,6 +2184,16 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
     }
 #endif
 
+    // Switch Pro output/feature reports: handshake, subcommands, rumble.
+    // Must route to the mode's handle_output so the USB handshake can complete.
+    if (output_mode == USB_OUTPUT_MODE_SWITCH_PRO) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SWITCH_PRO];
+        if (mode && mode->handle_output) {
+            mode->handle_output(report_id, buffer, bufsize);
+        }
+        return;
+    }
+
     (void)report_id;
     (void)buffer;
     (void)bufsize;
