@@ -80,6 +80,7 @@ extern const usbd_mode_t sinput_mode;
 extern const usbd_mode_t xinput_mode;
 #endif
 extern const usbd_mode_t switch_mode;
+extern const usbd_mode_t switch_pro_mode;
 extern const usbd_mode_t ps3_mode;
 // PS3 auth feature report handler (called from tud_hid_set_report_cb)
 void ps3_mode_set_feature_report(uint8_t report_id, const uint8_t* buffer, uint16_t bufsize);
