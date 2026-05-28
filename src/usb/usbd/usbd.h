@@ -24,6 +24,7 @@ typedef enum {
     USB_OUTPUT_MODE_PS3,                // PlayStation 3 (DInput/SixAxis)
     USB_OUTPUT_MODE_PS4,                // PlayStation 4
     USB_OUTPUT_MODE_SWITCH,             // Nintendo Switch (docked)
+    USB_OUTPUT_MODE_SWITCH_PRO,         // Nintendo Switch Pro Controller (full protocol: motion + HD rumble)
     USB_OUTPUT_MODE_PSCLASSIC,          // PlayStation Classic (PS1 Mini)
     USB_OUTPUT_MODE_XBOX_ORIGINAL,      // Original Xbox (XID protocol)
     USB_OUTPUT_MODE_XBONE,              // Xbox One (GIP protocol)
