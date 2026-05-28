@@ -169,13 +169,13 @@ typedef struct {
     bool has_rumble;            // Device supports rumble
     bool has_force_feedback;    // Device supports force feedback
 
-    // Motion data (SIXAXIS/DualShock/DualSense)
-    // Accelerometer: raw sensor values, typically ~512 center for DS3, signed for DS4/DS5
-    // Gyroscope: angular velocity, DS3 only has Z axis (X/Y remain 0)
-    int16_t accel[3];           // Accelerometer X, Y, Z
-    int16_t gyro[3];            // Gyroscope X, Y, Z
-    uint16_t gyro_range;        // Gyro full-scale range in dps (e.g., 100 for DS3, 2000 for DS4/DS5)
-    uint16_t accel_range;       // Accel full-scale range in milli-g (e.g., 2000 for DS3, 4000 for DS4/DS5)
+    // Motion data — see src/core/imu_frame.h for the canonical frame contract
+    // (axes, gyro index/sign convention, units-via-declared-range model, and
+    // per-controller declared values).
+    int16_t accel[3];           // Accelerometer X, Y, Z (canonical: +X right, +Y up, +Z toward user)
+    int16_t gyro[3];            // Gyroscope X, Y, Z (canonical: pitch, yaw, roll; CCW-positive)
+    uint16_t gyro_range;        // Gyro full-scale range in dps (e.g., 100 for DS3, 2048 for DS4/DS5, 2000 for Switch Pro)
+    uint16_t accel_range;       // Accel full-scale range in milli-g (e.g., 2000 for DS3, 4000 for DS4/DS5, 8000 for Switch Pro)
     bool has_motion;            // Motion data is valid
 
     // Pressure-sensitive button data (DS3)
@@ -235,9 +235,12 @@ static inline void init_input_event(input_event_t* event) {
     event->button_count = 4;  // Default to 4 face buttons
 
     // Clear motion data
+    // Defaults match DS4/DS5 nominal (most common motion source). Drivers with
+    // different ranges (DS3, Switch Pro) MUST set their own per the canonical
+    // frame contract (src/core/imu_frame.h).
     event->has_motion = false;
-    event->gyro_range = 2000;   // Default to DS4/DS5 range (±2000 dps)
-    event->accel_range = 4000;  // Default to DS4/DS5 range (±4g in milli-g)
+    event->gyro_range = 2048;   // DS4/DS5 nominal: +/-2048 dps (1024 LSB/dps)
+    event->accel_range = 4000;  // DS4/DS5 nominal: +/-4g (8192 LSB/g)
     for (int i = 0; i < 3; i++) {
         event->accel[i] = 0;
         event->gyro[i] = 0;

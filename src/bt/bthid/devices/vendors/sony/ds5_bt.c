@@ -341,6 +341,15 @@ static bool ds5_init(bthid_device_t* device)
             ds5_data[i].event.instance = 0;
             ds5_data[i].event.button_count = 14;
             ds5_data[i].event.has_motion = true;
+            // DualSense IMU: native frame matches canonical (+X right, +Y up,
+            // +Z toward user); gyro pitch/yaw/roll on indices 0/1/2. So values
+            // pass through axis-unchanged. Declared ranges are the documented
+            // DualSense nominal: +/-4g accel (8192 LSB/g), +/-2048 dps gyro
+            // (1024 LSB/dps). Per-device factory calibration (feature report
+            // 0x05) is pending the DS5 feature-receive infrastructure work.
+            // See src/core/imu_frame.h for the canonical-frame contract.
+            ds5_data[i].event.accel_range = 4000;   // +/-4g in milli-g
+            ds5_data[i].event.gyro_range  = 2048;   // +/-2048 dps
 
             device->driver_data = &ds5_data[i];
 
