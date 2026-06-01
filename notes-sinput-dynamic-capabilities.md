@@ -48,6 +48,18 @@ Timing. Features-response query happens before motion-capable input has been
 seen. Host caches the inaccurate response. No mechanism currently forces the
 host to re-read.
 
+## Verification
+
+Diagnostic test on `feature/sinput-dynamic-capabilities`: temporarily set
+`cached_has_motion = true` at module init in `sinput_mode.c` and prevented
+per-event overwriting. Flashed to dongle, plugged into Windows with no
+controller paired. **Steam's controller config showed the gyro/accel
+calibration menu**, confirming that the host honors motion-capability
+declaration in the features response when it's set at the moment of host
+query. The bug is purely timing, not byte layout or descriptor structure.
+Diagnostic reverted; real implementation requires re-enumeration on
+capability change.
+
 ## Proposed design
 
 ### USB device lifecycle bound to merged-event capabilities
@@ -129,30 +141,74 @@ with the same `has_*` semantics.
 Precedent: ds5dongle uses a related model (no enumeration until paired). This
 design is friendlier — device visible from boot, capabilities update on pair.
 
-## Suggested implementation order
+## Implementation order (staged)
 
-1. **Proof-of-concept:** verify `tud_disconnect()` + delay + `tud_connect()`
-   works cleanly on Pico 2 W with TinyUSB. Add a UART command or button
-   trigger; observe Steam's reaction.
-2. **Capability tracking:** add to `sinput_mode.c` a `last_advertised_caps`
-   struct holding the capability flags that were active at the last
-   enumeration. Compare against current merged-event flags on each event.
-3. **Debounced re-enumeration trigger:** when current ≠ last for N consecutive
-   events spanning at least M ms, schedule re-enumeration.
-4. **Re-enumeration mechanics:** `tud_disconnect()`, sleep N ms, update
-   advertised capabilities to current merged state, `tud_connect()`.
-5. **Empty-state on no controllers:** when last controller disconnects, drive
-   capabilities to empty state and re-enumerate.
-6. **README documentation:** add user-facing behavior section.
-7. **Test matrix:**
-   - DS5 only (motion + touch + rumble)
-   - Switch Pro 1 only (motion + rumble, no touch)
-   - DS3 only (limited motion, pressure-sensitive buttons)
-   - Xbox Series only (no motion)
-   - DS5 → swap to Switch Pro 1 → swap back
-   - DS5 + Switch Pro 1 simultaneously (MERGE_BLEND)
-   - DS5 disconnects mid-session, reconnects
-   - All controllers disconnect, Steam should show capability changes
+Each step is a small commit, each is testable on hardware, each builds on
+the previous. The discipline is: verify on hardware before moving to the next
+step. If something doesn't work as expected at a given step, the design may
+need revisiting before further investment.
+
+### Step 1: TinyUSB re-enumeration proof-of-concept
+
+Verify that `tud_disconnect()` + delay + `tud_connect()` produces a clean
+re-enumeration on the Pico 2 W with joypad-os's existing TinyUSB
+configuration, and that Steam recognizes the device coming back without
+manual intervention.
+
+Implementation: trigger re-enumeration from a testable signal — easiest
+option is "after N seconds of running, re-enumerate once," logged over UART.
+Flash, plug into PC, observe Steam.
+
+Outcomes:
+- Clean re-enumeration with Steam re-finding the device: green light, proceed.
+- Device hangs, host shows error, or Steam loses the device permanently:
+  red light, redesign required.
+
+This is throwaway code — do not commit beyond this step. Once the
+proof-of-concept is verified or fails, revert and proceed (or revisit design).
+
+### Step 2: Empty-state initial enumeration
+
+Make the dongle enumerate with empty capabilities at boot: no buttons, no
+axes, no motion, no touch, no rumble, no LEDs. Steam should see the SInput
+device but no configurable menus.
+
+Implementation: modify `sinput_mode.c`'s features-response builder so that
+when no controller has connected (`cached_*` flags all false and
+`last_dev_addr == -1`), it emits a zeroed capability set. Verify by flashing
+and plugging in with no controller paired.
+
+### Step 3: Capability tracking + re-enumeration on first connect
+
+Add the state machine that observes merged-event capabilities (motion,
+touch, pressure, button count, etc.), records the last-advertised set, and
+triggers re-enumeration when the current set differs.
+
+Initial test: plug in dongle (empty state), pair a DS5, watch Steam refresh
+to show the gyro menu.
+
+### Step 4: Re-enumeration on controller swap
+
+Verify that swapping controllers — DS5 (motion + touch) → Switch Pro 1
+(motion only) → Xbox Series (none) — produces correct Steam UI updates at
+each transition.
+
+### Step 5: Return to empty on last controller disconnect
+
+When all controllers disconnect, capabilities should revert to empty and the
+device should re-enumerate. Steam should drop the configurable menus.
+
+### Step 6: Debouncing
+
+Add a stability window (suggested: 200-500 ms) before triggering
+re-enumeration on capability change, to avoid thrashing on brief BT flaps.
+
+### Step 7: README documentation
+
+Document the user-facing behavior:
+- Dongle appears in Steam immediately on plug-in.
+- Configurable capabilities appear after a controller is paired and active.
+- Brief reconnect occurs when controllers are swapped.
 
 ## References
 
