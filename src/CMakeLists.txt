@@ -147,6 +147,7 @@ set(USB_HOST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/raphnet/raphnet_pce.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_dualstrike.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_commander.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/hid/devices/generic/sinput_host.c
     ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbh/xinput/xinput.c
 )
@@ -761,6 +762,30 @@ joypad_target_common(joypad_n642dc)
 # No BTstack for n642dc - uses native N64 input, not USB host
 pico_generate_pio_header(joypad_n642dc ${CMAKE_CURRENT_LIST_DIR}/lib/joybus-pio/src/joybus.pio)
 pico_generate_pio_header(joypad_n642dc ${CMAKE_CURRENT_LIST_DIR}/native/device/dreamcast/maple.pio)
+
+# --- GameCube to Dreamcast (KB2040) ---
+# Same PIO layout as n642dc — gc_host shares joybus.pio with the N64 driver,
+# so it uses PIO1 SM3 at offset 10 and leaves PIO1 SM0-2 for maple_rx.
+# Core-0 TX required for the same reason (joybus on PIO1 SM3).
+add_executable(joypad_gc2dc)
+target_compile_definitions(joypad_gc2dc PRIVATE CONFIG_GC2DC=1 CONFIG_DC=1 CONFIG_NO_NEOPIXEL=1 GC_PIN_DATA=29)
+target_sources(joypad_gc2dc PUBLIC ${COMMON_SOURCES}
+    ${GC_HOST_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/dreamcast_device.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast/maple_state_machine.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/gc2dc/app.c
+)
+target_include_directories(joypad_gc2dc PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/gc2dc
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/host/gc
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/device/dreamcast
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/joybus-pio/include
+)
+target_link_libraries(joypad_gc2dc PRIVATE ${COMMON_LIBRARIES} hardware_dma)
+joypad_target_common(joypad_gc2dc)
+# No BTstack — native GC input, no USB host.
+pico_generate_pio_header(joypad_gc2dc ${CMAKE_CURRENT_LIST_DIR}/lib/joybus-pio/src/joybus.pio)
+pico_generate_pio_header(joypad_gc2dc ${CMAKE_CURRENT_LIST_DIR}/native/device/dreamcast/maple.pio)
 
 # --- N64 to Dreamcast (Pico 2 W) ---
 # Pinout: DC SDCKA=GPIO14, SDCKB=GPIO15 (physical pins 19/20)

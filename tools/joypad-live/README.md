@@ -11,7 +11,7 @@ viewer-interaction bots, accessibility apps, automation, telemetry pipelines.
 your app / bot / overlay  ──HTTP──▶  joypad-live  ──CDC──▶  Joypad OS adapter
 ```
 
-The full design + protocol docs are in [`.dev/docs/streamer-live-remap.md`](../../.dev/docs/streamer-live-remap.md).
+The full design + protocol docs are in [`streamer-live-remap.md`](./streamer-live-remap.md).
 
 ## Two reference implementations, same contract
 

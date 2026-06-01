@@ -1,0 +1,4 @@
+nes-py>=8.2.1
+openai>=1.40.0
+Pillow>=10.0.0
+# nes-py pins its own pyglet for --render; don't constrain it here.

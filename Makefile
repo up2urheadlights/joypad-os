@@ -156,6 +156,7 @@ APP_usb2neogeo_rp2040zero := rp2040zero neogeo_rp2040zero usb2neogeo_rp2040zero 
 APP_usb2neogeo_retrofrog := rp2040zero neogeo_retrofrog usb2neogeo_retrofrog USB/BT NEOGEO
 APP_n642dc_kb2040 := kb2040 n642dc n642dc_kb2040 N64 Dreamcast
 APP_n642dc_pico2_w := pico2_w n642dc_pico2_w n642dc_pico2_w N64 Dreamcast
+APP_gc2dc_kb2040 := kb2040 gc2dc gc2dc_kb2040 GameCube Dreamcast
 APP_nes2usb_kb2040 := kb2040 nes2usb nes2usb_kb2040 NES USB
 APP_nes2usb_pico_w := pico_w nes2usb nes2usb_pico_w NES USB
 APP_n642nuon_pico := pico n642nuon n642nuon_pico N64 Nuon
@@ -498,6 +499,10 @@ usb2neogeo_retrofrog:
 .PHONY: n642dc_kb2040
 n642dc_kb2040:
 	$(call build_app,n642dc_kb2040)
+
+.PHONY: gc2dc_kb2040
+gc2dc_kb2040:
+	$(call build_app,gc2dc_kb2040)
 
 .PHONY: n642dc_pico2_w
 n642dc_pico2_w:
@@ -1214,6 +1219,10 @@ flash-usb2dc_rp2040zero:
 .PHONY: flash-n642dc_kb2040
 flash-n642dc_kb2040:
 	@$(MAKE) --no-print-directory _flash_app APP_NAME=n642dc_kb2040
+
+.PHONY: flash-gc2dc_kb2040
+flash-gc2dc_kb2040:
+	@$(MAKE) --no-print-directory _flash_app APP_NAME=gc2dc_kb2040
 
 .PHONY: flash-n642dc_pico2_w
 flash-n642dc_pico2_w:

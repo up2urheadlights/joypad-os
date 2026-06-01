@@ -832,9 +832,16 @@ void router_submit_input(const input_event_t* event) {
     if (!event) return;
     if (route_count == 0) return;
 
-    // Stream input to CDC for web config (if enabled)
+    // Stream input to CDC for web config (only when a host is actively
+    // consuming the stream). Without this gate the prep work below —
+    // notably get_device_name(), which reaches into tuh_vid_pid_get() and
+    // the HID registry — runs on every USB controller report (~1 kHz on a
+    // native HID pad) even on output modes whose USB device is in HOST
+    // mode (usb2gc, usb2dc, etc.) where CDC isn't enumerated at all and
+    // the callee returns immediately anyway. Tight per-event loop matters
+    // for high-precision input like Melee dash dancing.
 #ifdef CONFIG_USB
-    {
+    if (cdc_commands_is_input_streaming()) {
         static const char* transport_names[] = {
             [INPUT_TRANSPORT_NONE]       = "none",
             [INPUT_TRANSPORT_USB]        = "usb",
