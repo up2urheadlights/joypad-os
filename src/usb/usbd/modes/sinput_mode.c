@@ -581,67 +581,99 @@ static void sinput_mode_task(void)
     f[0] = 0x00;
     f[1] = 0x01;
 
-    // Capability flags 1: bit 0=rumble, bit 1=player LED, bit 2=accel, bit 3=gyro,
-    //                     bit 4=LX/LY stick, bit 5=RX/RY stick,
-    //                     bit 6=LT analog trigger, bit 7=RT analog trigger
-    // SDL3's SInput driver reads stick/trigger presence from bits 4-7 here, not
-    // from the input report — without these set, Steam reports 0 axes.
-    f[2] = 0xF3;  // rumble + player LED + both sticks + both triggers
-    if (cached_has_motion) {
-        f[2] |= 0x0C;  // bit 2 = accel, bit 3 = gyro
-    }
-
-    // Capability flags 2: bit 0=touchpad, bit 1=RGB LED, bit 2=is_handheld
-    // SDL3 gates touchpad processing on bit 0 — touchpad_count at byte 16 is
-    // ignored without it.
-    f[3] = 0x02;  // bit 1 = RGB LED always
-    if (cached_has_touch) {
-        f[3] |= 0x01;  // bit 0 = touchpad supported
-    }
-
-    // Gamepad type (from connected device)
-    f[4] = cached_gamepad_type;
-
-    // Face style (from connected device) | sub product (0)
-    f[5] = (cached_face_style << 5);
-
-    // Polling rate: 1000 microseconds (1000Hz) — matches the 1ms HID endpoint
-    // bInterval. SDL also derives its gyro/accel sensor rate from this value.
-    f[6] = 0xE8;  // 1000 & 0xFF
-    f[7] = 0x03;  // 1000 >> 8
-
-    // Accel/Gyro ranges (uint16 LE): 0 = not supported
-    if (cached_has_motion) {
-        // Accel range: 4 (+/- 4G, typical for DS4/DS5)
-        f[8] = 4;
-        f[9] = 0;
-        // Gyro range: 2000 (+/- 2000 dps, typical for DS4/DS5)
-        f[10] = 0xD0;  // 2000 & 0xFF
-        f[11] = 0x07;  // 2000 >> 8
+    // Empty-state declaration: if no controller has ever connected to this
+    // dongle since boot (`last_dev_addr == -1`), advertise zero capabilities.
+    // The dongle is visible to the host as a SInput device — confirming the
+    // dongle is alive — but with nothing configurable. Once a controller
+    // connects, the dynamic-capabilities path (step 3+) updates the cached
+    // capabilities and re-enumerates so the host sees accurate features.
+    //
+    // Why this matters: the host (e.g., Steam via SDL) reads the features
+    // response once during USB enumeration and caches the result. If we
+    // advertise default capabilities at boot before any controller has
+    // attached, the host caches incorrect values that don't reflect the
+    // controller actually used. Empty-state at boot + re-enumeration when
+    // capabilities change is the design fix for that issue.
+    if (last_dev_addr == -1) {
+        // f[2..17] all zero — no flags, no gamepad type, no ranges,
+        // no buttons, no touchpads. Polling rate at f[6..7] still set
+        // below the if-else because SDL uses it for sensor rate calc;
+        // safe to leave non-zero even with empty capabilities.
+        f[2] = 0x00;
+        f[3] = 0x00;
+        f[4] = 0x00;   // SINPUT_TYPE_UNKNOWN
+        f[5] = 0x00;
+        f[6] = 0xE8;   // polling rate low byte (1000 us)
+        f[7] = 0x03;   // polling rate high byte
+        f[8]  = 0; f[9]  = 0;   // no accel range
+        f[10] = 0; f[11] = 0;   // no gyro range
+        f[12] = 0; f[13] = 0; f[14] = 0; f[15] = 0;   // no button usage masks
+        f[16] = 0; f[17] = 0;                          // no touchpads
+        // Serial (board unique ID) still set below the if-else so the device
+        // has a stable identity even in empty state.
     } else {
-        f[8] = 0;
-        f[9] = 0;
-        f[10] = 0;
-        f[11] = 0;
-    }
+        // Capability flags 1: bit 0=rumble, bit 1=player LED, bit 2=accel, bit 3=gyro,
+        //                     bit 4=LX/LY stick, bit 5=RX/RY stick,
+        //                     bit 6=LT analog trigger, bit 7=RT analog trigger
+        // SDL3's SInput driver reads stick/trigger presence from bits 4-7 here, not
+        // from the input report — without these set, Steam reports 0 axes.
+        f[2] = 0xF3;  // rumble + player LED + both sticks + both triggers
+        if (cached_has_motion) {
+            f[2] |= 0x0C;  // bit 2 = accel, bit 3 = gyro
+        }
 
-    // Button usage masks: which buttons are active per byte
-    // Byte 0: EAST|SOUTH|NORTH|WEST|DU|DD|DL|DR = all 8 bits
-    f[12] = 0xFF;
-    // Byte 1: L3|R3|L1|R1|L2|R2|L_PADDLE1|R_PADDLE1 = all 8 bits
-    f[13] = 0xFF;
-    // Byte 2: START|BACK|GUIDE|CAPTURE = lower 4 bits
-    f[14] = 0x0F;
-    // Byte 3: MISC4 (mute/assistant) + MISC5
-    f[15] = 0x06;
+        // Capability flags 2: bit 0=touchpad, bit 1=RGB LED, bit 2=is_handheld
+        // SDL3 gates touchpad processing on bit 0 — touchpad_count at byte 16 is
+        // ignored without it.
+        f[3] = 0x02;  // bit 1 = RGB LED always
+        if (cached_has_touch) {
+            f[3] |= 0x01;  // bit 0 = touchpad supported
+        }
 
-    // Touchpad
-    if (cached_has_touch) {
-        f[16] = 1;  // 1 touchpad
-        f[17] = 2;  // 2 fingers max
-    } else {
-        f[16] = 0;  // no touchpads
-        f[17] = 0;
+        // Gamepad type (from connected device)
+        f[4] = cached_gamepad_type;
+
+        // Face style (from connected device) | sub product (0)
+        f[5] = (cached_face_style << 5);
+
+        // Polling rate: 1000 microseconds (1000Hz) — matches the 1ms HID endpoint
+        // bInterval. SDL also derives its gyro/accel sensor rate from this value.
+        f[6] = 0xE8;  // 1000 & 0xFF
+        f[7] = 0x03;  // 1000 >> 8
+
+        // Accel/Gyro ranges (uint16 LE): 0 = not supported
+        if (cached_has_motion) {
+            // Accel range: 4 (+/- 4G, typical for DS4/DS5)
+            f[8] = 4;
+            f[9] = 0;
+            // Gyro range: 2000 (+/- 2000 dps, typical for DS4/DS5)
+            f[10] = 0xD0;  // 2000 & 0xFF
+            f[11] = 0x07;  // 2000 >> 8
+        } else {
+            f[8] = 0;
+            f[9] = 0;
+            f[10] = 0;
+            f[11] = 0;
+        }
+
+        // Button usage masks: which buttons are active per byte
+        // Byte 0: EAST|SOUTH|NORTH|WEST|DU|DD|DL|DR = all 8 bits
+        f[12] = 0xFF;
+        // Byte 1: L3|R3|L1|R1|L2|R2|L_PADDLE1|R_PADDLE1 = all 8 bits
+        f[13] = 0xFF;
+        // Byte 2: START|BACK|GUIDE|CAPTURE = lower 4 bits
+        f[14] = 0x0F;
+        // Byte 3: MISC4 (mute/assistant) + MISC5
+        f[15] = 0x06;
+
+        // Touchpad
+        if (cached_has_touch) {
+            f[16] = 1;  // 1 touchpad
+            f[17] = 2;  // 2 fingers max
+        } else {
+            f[16] = 0;  // no touchpads
+            f[17] = 0;
+        }
     }
 
     // Serial number from board unique ID (last 6 bytes of 8-byte ID)

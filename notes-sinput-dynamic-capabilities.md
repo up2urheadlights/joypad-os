@@ -50,6 +50,8 @@ host to re-read.
 
 ## Verification
 
+### Hypothesis confirmation (capability advertisement timing)
+
 Diagnostic test on `feature/sinput-dynamic-capabilities`: temporarily set
 `cached_has_motion = true` at module init in `sinput_mode.c` and prevented
 per-event overwriting. Flashed to dongle, plugged into Windows with no
@@ -59,6 +61,39 @@ declaration in the features response when it's set at the moment of host
 query. The bug is purely timing, not byte layout or descriptor structure.
 Diagnostic reverted; real implementation requires re-enumeration on
 capability change.
+
+### Re-enumeration mechanism (step 1 POC)
+
+Diagnostic test on `feature/sinput-dynamic-capabilities`: added a
+time-triggered `tud_disconnect()` + 500 ms delay + `tud_connect()` block to
+`usbd_task()`. Flashed and plugged into Windows. **Device enumerated
+normally, disappeared at the 10-second mark, and re-appeared cleanly within
+~500 ms. Steam reacquired the device without manual intervention.** This
+validates the lighter `tud_disconnect()`/`tud_connect()` re-enumeration
+approach for the dynamic-capabilities design. Diagnostic reverted.
+
+## Future-work observation: mode-change reboot
+
+Joypad-os's existing mode-change path (`usbd_set_mode`, ~line 430 in
+`usbd.c`) calls `platform_reboot()` to re-enumerate the USB device with a
+different mode's descriptors. The step-1 POC suggests the lighter
+`tud_disconnect()`/`tud_connect()` mechanism *might* be applicable to mode
+changes too — eliminating the visible boot delay and BT reconnection cost
+on mode switch.
+
+However, mode change is substantially more invasive than capability change:
+different VID/PID, different HID report descriptor, different endpoints,
+different host driver association, and mode-specific global state that's
+currently re-initialized only via reboot. Replacing the reboot would
+require:
+
+- Auditing every piece of state currently reset by `platform_reboot()`.
+- Determining which can be cleanly re-initialized in place.
+- Testing all mode transitions for state leakage.
+
+Out of scope for this branch. Worth a separate investigation under a
+follow-up branch (suggested name: `feature/mode-change-no-reboot`) once
+dynamic capabilities lands.
 
 ## Proposed design
 
