@@ -50,8 +50,6 @@ host to re-read.
 
 ## Verification
 
-### Hypothesis confirmation (capability advertisement timing)
-
 Diagnostic test on `feature/sinput-dynamic-capabilities`: temporarily set
 `cached_has_motion = true` at module init in `sinput_mode.c` and prevented
 per-event overwriting. Flashed to dongle, plugged into Windows with no
@@ -61,39 +59,6 @@ declaration in the features response when it's set at the moment of host
 query. The bug is purely timing, not byte layout or descriptor structure.
 Diagnostic reverted; real implementation requires re-enumeration on
 capability change.
-
-### Re-enumeration mechanism (step 1 POC)
-
-Diagnostic test on `feature/sinput-dynamic-capabilities`: added a
-time-triggered `tud_disconnect()` + 500 ms delay + `tud_connect()` block to
-`usbd_task()`. Flashed and plugged into Windows. **Device enumerated
-normally, disappeared at the 10-second mark, and re-appeared cleanly within
-~500 ms. Steam reacquired the device without manual intervention.** This
-validates the lighter `tud_disconnect()`/`tud_connect()` re-enumeration
-approach for the dynamic-capabilities design. Diagnostic reverted.
-
-## Future-work observation: mode-change reboot
-
-Joypad-os's existing mode-change path (`usbd_set_mode`, ~line 430 in
-`usbd.c`) calls `platform_reboot()` to re-enumerate the USB device with a
-different mode's descriptors. The step-1 POC suggests the lighter
-`tud_disconnect()`/`tud_connect()` mechanism *might* be applicable to mode
-changes too — eliminating the visible boot delay and BT reconnection cost
-on mode switch.
-
-However, mode change is substantially more invasive than capability change:
-different VID/PID, different HID report descriptor, different endpoints,
-different host driver association, and mode-specific global state that's
-currently re-initialized only via reboot. Replacing the reboot would
-require:
-
-- Auditing every piece of state currently reset by `platform_reboot()`.
-- Determining which can be cleanly re-initialized in place.
-- Testing all mode transitions for state leakage.
-
-Out of scope for this branch. Worth a separate investigation under a
-follow-up branch (suggested name: `feature/mode-change-no-reboot`) once
-dynamic capabilities lands.
 
 ## Proposed design
 
@@ -244,6 +209,84 @@ Document the user-facing behavior:
 - Dongle appears in Steam immediately on plug-in.
 - Configurable capabilities appear after a controller is paired and active.
 - Brief reconnect occurs when controllers are swapped.
+
+## Observed side-effects of the step 3 implementation
+
+The step 3 implementation produces one user-visible change that wasn't part
+of the stated goal but is worth recording:
+
+- **Controller-specific graphics in Steam.** With the dongle alone (no
+  controller paired), Steam shows generic input UI. After pairing a DS5,
+  the re-enumeration causes Steam to read an updated features response in
+  which `cached_face_style` and `cached_gamepad_type` reflect the connected
+  controller (Sony face / PS5 type for DS5). Steam then displays the
+  correct DualSense graphics and button labels. On stock joypad-os (no
+  dynamic capabilities), the device identifies as generic for the entire
+  session because the features response is only read once at boot, before
+  any controller has connected — so Steam falls back to Xbox-style
+  graphics.
+
+  This is a side-effect of the same mechanism that surfaces the gyro menu:
+  the features response is re-read after a controller pairs, so Steam sees
+  the controller-specific identity in addition to the controller-specific
+  capabilities.
+
+  Verified for DS5 only. Other controllers (DS4, Switch Pro, Wii U Pro,
+  etc.) should be tested as their drivers get the same synthetic-event
+  treatment in follow-up work.
+
+  **Note on persistence after disconnect**: After the controller
+  disconnects, Steam continues to show the controller-specific graphics
+  (e.g. DualSense art persists). Step 5 (return-to-empty on last
+  disconnect) will need to reset `cached_face_style`, `cached_gamepad_type`,
+  `cached_has_motion`, `cached_has_touch`, and `last_dev_addr` so the
+  features response builder takes the empty branch again. Currently those
+  values persist through the unpair re-enumeration.
+
+## Known button-mapping issues observed during DS5 testing
+
+These were observed during step 3 verification but are pre-existing bugs in
+joypad-os main (verified by flashing the most recent upstream release).
+Listed here as documentation; only the face-button swap is fixed in this
+PR. The remaining issues are scoped for follow-up work.
+
+1. **Face buttons swapped** — Cross↔Circle and Square↔Triangle. SInput
+   descriptor byte 0 bit order in joypad-os doesn't match SInput-LIB's
+   authoritative struct (south=bit 0, east=bit 1, west=bit 2, north=bit 3).
+   Fixed in this PR (separate commit).
+
+2. **Touchpad clicks fire the mic-mute event** instead of touchpad-click.
+
+3. **Mic-mute button on DS5 produces no event.**
+
+4. **Touchpad clicks appear in Steam's controller config as unlabeled
+   binary inputs** (true/false, no label string).
+
+5. **Macro Button 2 / Macro Button 3** (Steam-side labels) appear active
+   when L2/R2 triggers are held — unclear whether this is a SInput
+   descriptor mismapping or a Steam-side rendering of trigger-as-button.
+
+## Future step: extend router's attached-transport exception to USB
+
+Step 3's cleanup added `INPUT_TRANSPORT_BT_CLASSIC` and
+`INPUT_TRANSPORT_BT_BLE` to the router's "attached device" exception
+(the exception that lets a device register a player without input
+activity, alongside the pre-existing `INPUT_TRANSPORT_NATIVE` and
+`INPUT_TRANSPORT_GPIO`). `INPUT_TRANSPORT_USB` was deliberately left
+out: it has the same logical property (a USB-host wired controller is
+physically present from the moment it enumerates), but joypad-os
+mainline ships no test rig where a wired USB-host controller could be
+exercised, and we don't have hardware to verify it on. Adding it
+speculatively would be an unverified change to a hot path.
+
+The follow-up: wire a USB-A female breakout to the Pico's GP2/GP3
+(default PIO USB pins), add Pico-PIO-USB host support to a test build,
+plug in a wired DS5, and verify the same dynamic-capabilities re-enum
+fires on plug-in (and Steam shows correct controller graphics) the
+same way it does for BT. If yes, extend the `attached` exception in
+both router.c sites to include `INPUT_TRANSPORT_USB`.
+
+Reference test firmware: github.com/fhoedemakers/pico-pio-usb-gamepad-test.
 
 ## References
 

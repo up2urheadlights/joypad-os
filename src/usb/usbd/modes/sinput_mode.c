@@ -78,6 +78,55 @@ static bool cached_has_touch = false;
 static controller_layout_t cached_layout = LAYOUT_UNKNOWN;  // last native layout (for feature refresh)
 static int16_t last_dev_addr = -1;  // Track connected device for auto feature report
 
+// ----------------------------------------------------------------------------
+// Dynamic capabilities — identity-change-triggered re-enumeration.
+//
+// Host (e.g. SDL via Steam) reads the features response once during USB
+// enumeration and caches the result. To make the host see accurate
+// capabilities for whatever controller is actually connected, we
+// re-enumerate (tud_disconnect → tud_connect) whenever the connected
+// device's identity (dev_addr) changes from what we last advertised.
+// Verified foundation: see step 1 POC in commit history.
+//
+// Why dev_addr (not capability flags): a re-enum is what makes Steam
+// re-read the features response. Steam then sees whatever's in the
+// caches (gamepad_type, face_style, has_motion, has_touch, etc.). The
+// trigger only needs to fire when the underlying device identity
+// changes — that's when caches would have different contents. Watching
+// capability flags directly is redundant: capabilities are determined
+// by hardware/firmware identity, so they're stable within a pairing
+// session and change at the same moment dev_addr does. This also
+// covers non-motion controllers automatically, since their identity
+// transition still fires the trigger even without any motion/touch
+// flag transition.
+//
+// State machine pumped from sinput_mode_task() every iteration.
+//   REENUM_IDLE         : steady state; watch for identity changes
+//   REENUM_PENDING      : identity change observed; sinput_mode_task
+//                         should call tud_disconnect() on next iteration
+//   REENUM_DISCONNECTED : tud_disconnect() done; call tud_connect() on
+//                         next iteration so TinyUSB has a chance to process
+//                         the disconnect on the wire before reconnect.
+// Non-blocking: the task returns between states; the main loop keeps
+// running BT, router, etc.
+//
+// Empirical note: calling tud_disconnect() and tud_connect() back to back
+// from the same function (no state machine, no iteration boundary) silently
+// fails — TinyUSB's queued state changes get coalesced and the host never
+// sees a disconnect cycle. The state machine separates these across at
+// least one iteration to ensure TinyUSB actually emits the disconnect on
+// the wire. No wall-clock delay is needed beyond that iteration boundary.
+// ----------------------------------------------------------------------------
+static int16_t last_advertised_dev_addr = -1;
+
+typedef enum {
+    REENUM_IDLE = 0,
+    REENUM_PENDING,         // identity change observed; sinput_mode_task should call tud_disconnect()
+    REENUM_DISCONNECTED,    // tud_disconnect() done; call tud_connect() on next iteration
+} reenum_state_t;
+
+static reenum_state_t reenum_state = REENUM_IDLE;
+
 // ============================================================================
 // CONVERSION HELPERS
 // ============================================================================
@@ -328,12 +377,31 @@ static bool sinput_mode_send_report(uint8_t player_index,
     // Send feature report when device changes (new address, different type,
     // or capability change). BT controllers reuse conn_index slots, so
     // address alone is not sufficient to detect a new device.
-    if (event->dev_addr != last_dev_addr ||
-        cached_gamepad_type != prev_type ||
-        cached_has_motion != prev_motion ||
-        cached_has_touch != prev_touch) {
+    //
+    // Skip for INPUT_TYPE_NONE events: the router emits a memset-zeroed
+    // neutralization event with type=NONE and dev_addr=0 when controllers
+    // disconnect. Updating last_dev_addr from that would poison the
+    // dynamic-capabilities state and prevent the post-disconnect reset
+    // from working correctly.
+    if (event->type != INPUT_TYPE_NONE &&
+        (event->dev_addr != last_dev_addr ||
+         cached_gamepad_type != prev_type ||
+         cached_has_motion != prev_motion ||
+         cached_has_touch != prev_touch)) {
         last_dev_addr = event->dev_addr;
         feature_request_pending = true;
+    }
+
+    // Dynamic-capabilities trigger (step 3): if the connected device's
+    // identity differs from what we last advertised to the host, schedule
+    // a USB re-enumeration so the host re-reads the features response and
+    // surfaces the right calibration menus. The state machine in
+    // sinput_mode_task() performs the actual tud_disconnect/connect across
+    // iteration boundaries (see comments on reenum_state_t for why).
+    if (reenum_state == REENUM_IDLE) {
+        if (last_dev_addr != last_advertised_dev_addr) {
+            reenum_state = REENUM_PENDING;
+        }
     }
 
     // Convert buttons to SInput format (32-bit across 4 bytes)
@@ -533,6 +601,47 @@ static const uint8_t* sinput_mode_get_report_descriptor(void)
 // Send feature response when pending
 static void sinput_mode_task(void)
 {
+    // Reset cached state on full disconnect. The router/player_manager
+    // doesn't notify output modes about device removal; we poll
+    // playersCount instead. When it drops to 0 and we still have a
+    // non-empty cached identity, treat as "no controller present" and
+    // reset. The dev_addr-only re-enum trigger fires naturally on the
+    // next event because last_dev_addr (-1) will then differ from
+    // last_advertised_dev_addr (the unpaired controller's addr).
+    //
+    // Safety: send_report ignores INPUT_TYPE_NONE (neutralization) events
+    // for last_dev_addr updates, so the router's post-disconnect "reset
+    // outputs to neutral" event doesn't poison last_dev_addr after we
+    // clear it here.
+    if (last_dev_addr != -1 && playersCount == 0) {
+        last_dev_addr = -1;
+        cached_has_motion = false;
+        cached_has_touch = false;
+        cached_gamepad_type = SINPUT_TYPE_STANDARD;
+        cached_face_style = SINPUT_FACE_XBOX;
+        // Trigger re-enum directly here so the empty state propagates to
+        // the host without waiting for the next input event (there won't
+        // be one — no controller is connected).
+        if (reenum_state == REENUM_IDLE) {
+            reenum_state = REENUM_PENDING;
+        }
+    }
+
+    // Dynamic-capabilities re-enumeration state machine (step 3). Runs every
+    // iteration regardless of feature_request_pending — fires on iteration
+    // boundary, not on new event arriving. Each tud_* call is separated
+    // from the next by at least one full task iteration so TinyUSB has time
+    // to emit the previous state change on the wire before being asked for
+    // the next one.
+    if (reenum_state == REENUM_PENDING) {
+        tud_disconnect();
+        reenum_state = REENUM_DISCONNECTED;
+    } else if (reenum_state == REENUM_DISCONNECTED) {
+        tud_connect();
+        last_advertised_dev_addr = last_dev_addr;
+        reenum_state = REENUM_IDLE;
+    }
+
     if (!feature_request_pending) return;
     if (!tud_hid_n_ready(ITF_NUM_HID_GAMEPAD)) return;
 

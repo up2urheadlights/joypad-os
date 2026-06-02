@@ -586,14 +586,19 @@ static inline void router_simple_mode(const input_event_t* event, output_target_
 
     if (player_index < 0) {
         // Check if any button pressed or analog stick moved beyond threshold.
-        // Native and GPIO devices are physically attached — register as soon
-        // as they submit any event, without waiting for input activity, so
-        // the web-config player list reflects them immediately on connect.
+        // Attached devices (native/GPIO/BT-paired) are logically present from
+        // the moment they submit any event — register them as soon as they do,
+        // without waiting for input activity, so the web-config player list
+        // reflects them immediately on connect and capability-aware output
+        // modes (e.g. SInput dynamic capabilities) can observe the
+        // controller before the user has had to press a button.
         uint32_t buttons_pressed = event->buttons | event->keys;
         bool analog_active = analog_beyond_threshold(event);
-        bool physically_attached = (event->transport == INPUT_TRANSPORT_NATIVE ||
-                                    event->transport == INPUT_TRANSPORT_GPIO);
-        if (buttons_pressed || analog_active || physically_attached) {
+        bool attached = (event->transport == INPUT_TRANSPORT_NATIVE ||
+                         event->transport == INPUT_TRANSPORT_GPIO ||
+                         event->transport == INPUT_TRANSPORT_BT_CLASSIC ||
+                         event->transport == INPUT_TRANSPORT_BT_BLE);
+        if (buttons_pressed || analog_active || attached) {
             const char* device_name = get_device_name(event);
             player_index = add_player(event->dev_addr, slot_inst, event->transport, device_name);
             if (player_index >= 0) {
@@ -640,7 +645,14 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
     if (player_index < 0) {
         uint32_t buttons_pressed = event->buttons | event->keys;
         bool analog_active = analog_beyond_threshold(event);
-        if (buttons_pressed || analog_active || event->type == INPUT_TYPE_MOUSE) {
+        // Attached devices (native/GPIO/BT-paired) register on first event,
+        // without waiting for input activity. Same rationale as in the
+        // non-merge path above.
+        bool attached = (event->transport == INPUT_TRANSPORT_NATIVE ||
+                         event->transport == INPUT_TRANSPORT_GPIO ||
+                         event->transport == INPUT_TRANSPORT_BT_CLASSIC ||
+                         event->transport == INPUT_TRANSPORT_BT_BLE);
+        if (buttons_pressed || analog_active || attached || event->type == INPUT_TYPE_MOUSE) {
             const char* device_name = get_device_name(event);
             player_index = add_player(event->dev_addr, slot_inst, event->transport, device_name);
             if (player_index >= 0) {

@@ -341,10 +341,17 @@ static bool ds5_init(bthid_device_t* device)
             ds5_data[i].event.instance = 0;
             ds5_data[i].event.button_count = 14;
             ds5_data[i].event.has_motion = true;
+            ds5_data[i].event.has_touch = true;   // DS5 always has a touchpad
 
             device->driver_data = &ds5_data[i];
 
-            // Activation happens in task (state machine with delays)
+            // Activation happens in task (state machine with delays).
+            // The synthetic initial input event is submitted from there
+            // (state 1 → 2 transition), AFTER BTHID has fully marked the
+            // device active. Submitting from here is too early — the router's
+            // player_manager can't resolve the device to a player slot yet,
+            // which results in no player assignment and a controller that
+            // never produces input events to downstream consumers.
             return true;
         }
     }
@@ -385,6 +392,11 @@ static void ds5_process_report(bthid_device_t* device, const uint8_t* data, uint
     }
 
     if (report_len < sizeof(ds5_input_report_t)) {
+        // Short reports are rejected here because they don't carry enough
+        // data to populate the full report struct. DS5 sends one short
+        // report on connect (data[0]=0x01, len=10) and otherwise only sends
+        // reports on input change. Hence the need for the synthetic init
+        // event submitted from ds5_task state 1.
         return;
     }
 
@@ -433,17 +445,19 @@ static void ds5_process_report(bthid_device_t* device, const uint8_t* data, uint
     ds5->event.analog[ANALOG_R2] = rpt->r2_trigger;
 
     // Motion data (DS5 has full 3-axis gyro and accel)
-    // Check if we have enough data for motion
+    // has_motion is a capability declaration set at driver init (search for
+    // `has_motion = true` above) — it describes whether the controller has
+    // motion sensors, not whether THIS particular report carries motion bytes.
+    // Short reports without motion data leave accel/gyro arrays at their last
+    // known values; the capability flag stays true so downstream code (router,
+    // sinput output, etc.) keeps treating the controller as motion-capable.
     if (report_len >= sizeof(ds5_input_report_t)) {
-        ds5->event.has_motion = true;
         ds5->event.accel[0] = rpt->accel[0];
         ds5->event.accel[1] = rpt->accel[1];
         ds5->event.accel[2] = rpt->accel[2];
         ds5->event.gyro[0] = rpt->gyro[0];
         ds5->event.gyro[1] = rpt->gyro[1];
         ds5->event.gyro[2] = rpt->gyro[2];
-    } else {
-        ds5->event.has_motion = false;
     }
 
     // Battery: status byte at report_data[52] — bits 0-3 = level (0-10), bits 4-7 = status
@@ -539,6 +553,24 @@ static void ds5_task(bthid_device_t* device)
                 ds5_send_output(device, 0, 0,
                     PLAYER_COLORS[idx][0], PLAYER_COLORS[idx][1], PLAYER_COLORS[idx][2],
                     PLAYER_LED_PATTERNS[pat_idx]);
+
+                // Submit a synthetic initial input event so capability-aware
+                // output modes (e.g., SInput dynamic capabilities) observe
+                // the controller's presence and declared capabilities without
+                // waiting for the user to press a button. DS5 doesn't send
+                // idle heartbeat reports — once paired, it stays silent until
+                // input changes — so without this synthetic event, downstream
+                // consumers wouldn't see the controller until first
+                // interaction.
+                //
+                // Running at activation state 1 -> 2 (after BTHID has marked
+                // the device active; submitting from ds5_init() is too early).
+                // The router treats BT-paired devices as "attached" for the
+                // purpose of player assignment, so the all-zero event below
+                // is sufficient to trigger registration without needing the
+                // driver to know about player_manager.
+                router_submit_input(&ds5->event);
+
                 ds5->activation_state = 2;
             }
             break;
