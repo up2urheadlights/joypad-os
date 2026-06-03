@@ -3242,22 +3242,22 @@ static void switch2_handle_feedback(void)
     if (!fb) return;
 
     // --- Handle Player LED ---
+    //
+    // led_dirty is true only when the host has issued a player-LED
+    // command this cycle, so when we enter this block we honor whatever
+    // the host sent verbatim — including pattern=0, which means "turn
+    // LEDs off." The previous code interpreted pattern=0 as "no value
+    // provided, fall back to player-index default," which prevented the
+    // host from ever turning the Pro 2's player LEDs off and produced
+    // the visible "LED 1 stays lit when Steam toggles off" bug.
     if (fb->led_dirty) {
-        // Determine LED pattern from feedback
-        uint8_t led_pattern = 0x01;  // Default to player 1
+        uint8_t led_pattern;
 
-        if (fb->led.pattern != 0) {
-            // Use pattern bits directly (0x01=P1, 0x02=P2, 0x04=P3, 0x08=P4)
-            // Convert to cumulative pattern for Switch 2
-            if (fb->led.pattern & 0x08) led_pattern = SW2_PLAYER_LED_PATTERNS[3];
-            else if (fb->led.pattern & 0x04) led_pattern = SW2_PLAYER_LED_PATTERNS[2];
-            else if (fb->led.pattern & 0x02) led_pattern = SW2_PLAYER_LED_PATTERNS[1];
-            else led_pattern = SW2_PLAYER_LED_PATTERNS[0];
-        } else {
-            // Use player index if no explicit pattern
-            int idx = (player_idx >= 0 && player_idx < 4) ? player_idx : 0;
-            led_pattern = SW2_PLAYER_LED_PATTERNS[idx];
-        }
+        if (fb->led.pattern & 0x08) led_pattern = SW2_PLAYER_LED_PATTERNS[3];
+        else if (fb->led.pattern & 0x04) led_pattern = SW2_PLAYER_LED_PATTERNS[2];
+        else if (fb->led.pattern & 0x02) led_pattern = SW2_PLAYER_LED_PATTERNS[1];
+        else if (fb->led.pattern & 0x01) led_pattern = SW2_PLAYER_LED_PATTERNS[0];
+        else                             led_pattern = 0x00;  // host requested off
 
         if (led_pattern != sw2_last_player_led) {
             sw2_last_player_led = led_pattern;

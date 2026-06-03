@@ -178,6 +178,15 @@ static bool xbox_init(bthid_device_t* device)
             xbox_data[i].event.dev_addr = device->conn_index;
             xbox_data[i].event.instance = 0;
             xbox_data[i].event.button_count = 10;
+            // Xbox controllers over BT do not expose motion, touchpad,
+            // host-configurable RGB, or per-player indicator LEDs.
+            // Explicit declarations rather than relying on init_input_event
+            // defaults so the device's capabilities are self-documenting
+            // alongside the other vendor drivers.
+            xbox_data[i].event.has_motion = false;
+            xbox_data[i].event.has_touch = false;
+            xbox_data[i].event.has_rgb_led = false;
+            xbox_data[i].event.has_player_led = false;
 
             device->driver_data = &xbox_data[i];
 

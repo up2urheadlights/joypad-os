@@ -154,6 +154,22 @@ static bool switch2_ble_init(bthid_device_t* device)
             switch2_data[i].event.instance = 0;
             switch2_data[i].event.button_count = 14;
 
+            // Capability declarations:
+            // - has_motion: Pro 2 has an IMU, but joypad-os doesn't read it
+            //   yet. Declared false here and revisited in the IMU PR.
+            // - has_touch: no touchpad.
+            // - has_rgb_led: no host-configurable RGB.
+            // - has_player_led: 4 player-indicator LEDs. Output path lives
+            //   in btstack_host.c (switch2_handle_feedback -> SET_LED via
+            //   ATT handle 0x0014); it is gated on the feedback layer's
+            //   led_dirty flag, so declaring this capability is what
+            //   allows Steam's LED Settings menu to actually surface and
+            //   drive the controller.
+            switch2_data[i].event.has_motion = false;
+            switch2_data[i].event.has_touch = false;
+            switch2_data[i].event.has_rgb_led = false;
+            switch2_data[i].event.has_player_led = true;
+
             device->driver_data = &switch2_data[i];
 
             return true;
