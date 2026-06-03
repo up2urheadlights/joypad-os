@@ -786,6 +786,16 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                         x_current_state.touch[1] = dev->touch[1];
                     }
 
+                    // LED capabilities (RGB lightbar/strip, player-number LED):
+                    // use first device that declares them. These are pure
+                    // capability flags — no per-frame data to copy alongside.
+                    if (dev->has_rgb_led && !x_current_state.has_rgb_led) {
+                        x_current_state.has_rgb_led = true;
+                    }
+                    if (dev->has_player_led && !x_current_state.has_player_led) {
+                        x_current_state.has_player_led = true;
+                    }
+
                     // Battery: use first device that reports battery
                     if (dev->battery_level > 0 && x_current_state.battery_level == 0) {
                         x_current_state.battery_level = dev->battery_level;

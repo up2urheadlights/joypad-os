@@ -19,6 +19,7 @@
 #include "tusb.h"
 #include "platform/platform.h"
 #include <stdio.h>
+#include <string.h>
 
 #ifdef BTSTACK_USE_ESP32
 #include "driver/gpio.h"
@@ -462,13 +463,16 @@ void app_task(void)
     // Route feedback from USB device output to BT controllers
     if (usbd_output_interface.get_feedback) {
         output_feedback_t fb;
+        memset(&fb, 0, sizeof(fb));
         if (usbd_output_interface.get_feedback(&fb)) {
             for (int i = 0; i < playersCount; i++) {
-                feedback_set_rumble(i, fb.rumble_left, fb.rumble_right);
-                if (fb.led_player > 0) {
+                if (fb.rumble_dirty) {
+                    feedback_set_rumble(i, fb.rumble_left, fb.rumble_right);
+                }
+                if (fb.player_led_dirty) {
                     feedback_set_led_player(i, fb.led_player);
                 }
-                if (fb.led_r || fb.led_g || fb.led_b) {
+                if (fb.rgb_dirty) {
                     feedback_set_led_rgb(i, fb.led_r, fb.led_g, fb.led_b);
                 }
             }

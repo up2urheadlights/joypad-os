@@ -376,6 +376,9 @@ static bool gc_adapter_mode_get_feedback(output_feedback_t* fb)
     fb->led_player = 0;
     fb->led_r = fb->led_g = fb->led_b = 0;
     fb->dirty = true;
+    fb->rumble_dirty = true;
+    // GC adapter doesn't carry LED/RGB intent from the host; leave per-field
+    // dirty clear for those so downstream apps don't propagate the zeros.
 
     gc_adapter_rumble_available = false;
     return true;

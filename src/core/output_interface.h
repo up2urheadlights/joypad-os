@@ -10,12 +10,24 @@
 #include "core/router/router.h"
 
 // Feedback state from output (agnostic representation)
+//
+// Per-field dirty flags distinguish "host sent value 0" (e.g., "turn LEDs
+// off") from "this field wasn't touched this call." Apps should propagate
+// only fields whose dirty flag is set. The legacy `dirty` flag stays as
+// "anything in here is set"; per-field flags refine that to which specific
+// fields are intentional.
+//
+// Output modes filling this struct should set BOTH the per-field dirty
+// flag(s) for whatever the host changed AND the top-level `dirty` flag.
 typedef struct {
     uint8_t rumble_left;        // Left (heavy) motor 0-255
     uint8_t rumble_right;       // Right (light) motor 0-255
-    uint8_t led_player;         // Player LED index (1-7), 0 = not set
-    uint8_t led_r, led_g, led_b;// RGB LED color
-    bool dirty;                 // True if feedback changed since last read
+    uint8_t led_player;         // Player LED index/pattern (0 = off when player_led_dirty)
+    uint8_t led_r, led_g, led_b;// RGB LED color (0,0,0 = off when rgb_dirty)
+    bool rumble_dirty;          // Per-field: host sent a rumble value this call
+    bool player_led_dirty;      // Per-field: host sent a player LED value this call
+    bool rgb_dirty;             // Per-field: host sent an RGB value this call
+    bool dirty;                 // Legacy: any per-field dirty; true if anything was set
 } output_feedback_t;
 
 // Output interface - abstracts different output types (native consoles, USB device, BLE, etc.)

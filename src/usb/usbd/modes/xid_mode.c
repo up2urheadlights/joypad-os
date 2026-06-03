@@ -124,6 +124,7 @@ static bool xid_mode_get_feedback(output_feedback_t* fb)
     fb->rumble_left = (uint8_t)(xid_rumble.rumble_l >> 8);
     fb->rumble_right = (uint8_t)(xid_rumble.rumble_r >> 8);
     fb->dirty = true;
+    fb->rumble_dirty = true;
     return true;
 }
 

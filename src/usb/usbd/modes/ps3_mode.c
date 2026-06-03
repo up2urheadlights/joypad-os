@@ -224,6 +224,8 @@ static bool ps3_mode_get_feedback(output_feedback_t* fb)
     }
 
     fb->dirty = true;
+    fb->rumble_dirty = true;
+    fb->player_led_dirty = true;
     ps3_output_available = false;
     return true;
 }

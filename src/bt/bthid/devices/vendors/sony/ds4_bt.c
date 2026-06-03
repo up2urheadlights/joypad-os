@@ -235,7 +235,12 @@ static bool ds4_init(bthid_device_t* device)
             ds4_data[i].event.dev_addr = device->conn_index;
             ds4_data[i].event.instance = 0;
             ds4_data[i].event.button_count = 14;
-            ds4_data[i].event.has_motion = true;  // DS4 has motion
+            ds4_data[i].event.has_motion = true;       // DS4 has accelerometer + 3-axis gyro
+            ds4_data[i].event.has_touch = true;        // DS4 has 2-finger touchpad
+            ds4_data[i].event.has_rgb_led = true;      // DS4 has host-configurable lightbar
+            ds4_data[i].event.has_player_led = false;  // DS4 has no separate player-indicator LEDs;
+                                                       // lightbar color is the player indicator
+                                                       // and is controlled via the RGB channel.
 
             device->driver_data = &ds4_data[i];
 
@@ -438,6 +443,14 @@ static void ds4_task(bthid_device_t* device)
                 // First SET_REPORT Output triggers DS4 to switch from basic (0x01)
                 // to enhanced (0x11) report mode with motion/touchpad data.
                 ds4_send_output(device, 0, 0, 0, 0, 64);
+
+                // Submit a synthetic input event so the router/USB stack
+                // sees the device's capabilities (has_motion, has_touch,
+                // has_rgb_led, has_player_led) and re-enumerates the USB
+                // device with the correct Steam Input features-response.
+                // Mirrors the DS5 and Switch Pro 1 activation flow.
+                router_submit_input(&ds4->event);
+
                 ds4->activation_state = 2;
             }
             break;
@@ -456,32 +469,19 @@ static void ds4_task(bthid_device_t* device)
                     uint8_t rumble_left = ds4->rumble_left;
                     uint8_t rumble_right = ds4->rumble_right;
 
-                    // Check LED from feedback system
+                    // Check LED from feedback system.
+                    //
+                    // When led_dirty is set, the host has issued an LED
+                    // command and we honor it verbatim — including RGB
+                    // (0,0,0) which means "lightbar off" (e.g., Steam
+                    // brightness slider at 0%). The previous code
+                    // interpreted (0,0,0) as "no host value, fall back
+                    // to player color," which prevented the user from
+                    // ever turning the lightbar off.
                     if (fb->led_dirty) {
-                        if (fb->led.r != 0 || fb->led.g != 0 || fb->led.b != 0) {
-                            // Host specified RGB color directly
-                            r = fb->led.r;
-                            g = fb->led.g;
-                            b = fb->led.b;
-                        } else if (fb->led.pattern != 0) {
-                            // Player LED pattern - convert to RGB color
-                            // Pattern bits: 0x01=P1, 0x02=P2, 0x04=P3, 0x08=P4
-                            int player_num = 0;
-                            if (fb->led.pattern & 0x01) player_num = 0;
-                            else if (fb->led.pattern & 0x02) player_num = 1;
-                            else if (fb->led.pattern & 0x04) player_num = 2;
-                            else if (fb->led.pattern & 0x08) player_num = 3;
-
-                            r = PLAYER_COLORS[player_num][0];
-                            g = PLAYER_COLORS[player_num][1];
-                            b = PLAYER_COLORS[player_num][2];
-                        } else {
-                            // Default to player index-based color
-                            int color_idx = player_idx % 4;
-                            r = PLAYER_COLORS[color_idx][0];
-                            g = PLAYER_COLORS[color_idx][1];
-                            b = PLAYER_COLORS[color_idx][2];
-                        }
+                        r = fb->led.r;
+                        g = fb->led.g;
+                        b = fb->led.b;
                         need_update = true;
                     }
 

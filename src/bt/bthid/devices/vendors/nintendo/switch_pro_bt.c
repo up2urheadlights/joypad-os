@@ -288,6 +288,8 @@ static bool switch_init(bthid_device_t* device)
             switch_data[i].event.dev_addr = device->conn_index;
             switch_data[i].event.instance = 0;
             switch_data[i].event.button_count = 10;
+            switch_data[i].event.has_player_led = true;  // 4 player-indicator LEDs (1-4 lit pattern)
+            // has_rgb_led stays false (default) — Pro 1 has no host-configurable RGB
 
             device->driver_data = &switch_data[i];
             return true;
@@ -447,6 +449,18 @@ static void switch_task(bthid_device_t* device)
         case SWITCH_STATE_SET_PLAYER_LED:
             if (now - sw->init_time >= SWITCH_INIT_DELAY_MS) {
                 printf("[SWITCH_BT] Init complete\n");
+
+                // Submit a synthetic initial input event so capability-aware
+                // output modes (e.g., SInput dynamic capabilities) observe
+                // the controller's presence and identity without waiting
+                // for the user to press a button. The router treats
+                // BT-paired transports as "attached" for the purpose of
+                // player assignment, so the all-zero event below is
+                // sufficient to trigger registration. Capabilities like
+                // has_motion remain false here; IMU support for Switch
+                // Pro is tracked separately.
+                router_submit_input(&sw->event);
+
                 sw->init_state = SWITCH_STATE_ACTIVE;
             }
             break;
@@ -473,10 +487,12 @@ static void switch_task(bthid_device_t* device)
             // Handle LED updates
             if (fb->led_dirty) {
                 uint8_t pattern = fb->led.pattern;
-                if (pattern != 0) {
-                    printf("[SWITCH_BT] LED update: pattern=0x%02X\n", pattern);
-                    switch_send_subcommand(device, SWITCH_SUBCMD_SET_PLAYER_LED, &pattern, 1);
-                }
+                // Always send the host-requested pattern, including 0 ("off").
+                // The previous (pattern != 0) guard treated 0 as "no value
+                // provided" and skipped, which prevented the host from
+                // turning the player LEDs off explicitly.
+                printf("[SWITCH_BT] LED update: pattern=0x%02X\n", pattern);
+                switch_send_subcommand(device, SWITCH_SUBCMD_SET_PLAYER_LED, &pattern, 1);
             }
 
             if (fb->rumble_dirty || fb->led_dirty) {

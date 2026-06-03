@@ -168,6 +168,8 @@ typedef struct {
     uint8_t button_count;       // Number of face buttons (2, 3, 4, 6, etc.)
     bool has_rumble;            // Device supports rumble
     bool has_force_feedback;    // Device supports force feedback
+    bool has_rgb_led;           // Device has host-configurable RGB LED (lightbar/strip)
+    bool has_player_led;        // Device has host-configurable player-number LED pattern
 
     // Motion data (SIXAXIS/DualShock/DualSense)
     // Accelerometer: raw sensor values, typically ~512 center for DS3, signed for DS4/DS5

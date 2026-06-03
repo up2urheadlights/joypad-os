@@ -188,6 +188,14 @@ typedef struct {
     uint8_t led_r, led_g, led_b;
     uint8_t player_led;
 
+    // True once the host has explicitly set a player LED via the
+    // feedback pipeline. While false, the driver task derives a
+    // player-index-based default each iteration to show which slot
+    // the controller occupies. Once true, the driver respects the
+    // last host command (including pattern=0 meaning "off") and
+    // stops fighting the host with the default.
+    bool host_set_player_led;
+
     // Touchpad swipe tracking
     uint16_t tpad_last_pos;
     bool tpad_dragging;
@@ -332,6 +340,7 @@ static bool ds5_init(bthid_device_t* device)
             ds5_data[i].led_g = 0;
             ds5_data[i].led_b = 64;  // Default blue
             ds5_data[i].player_led = PLAYER_LED_PATTERNS[0];
+            ds5_data[i].host_set_player_led = false;
             ds5_data[i].tpad_last_pos = 0;
             ds5_data[i].tpad_dragging = false;
 
@@ -342,6 +351,8 @@ static bool ds5_init(bthid_device_t* device)
             ds5_data[i].event.button_count = 14;
             ds5_data[i].event.has_motion = true;
             ds5_data[i].event.has_touch = true;   // DS5 always has a touchpad
+            ds5_data[i].event.has_rgb_led = true;     // touchpad RGB strip + lightbar
+            ds5_data[i].event.has_player_led = true;  // 5 white player-indicator LEDs below touchpad
 
             device->driver_data = &ds5_data[i];
 
@@ -590,41 +601,26 @@ static void ds5_task(bthid_device_t* device)
                     uint8_t rumble_left = ds5->rumble_left;
                     uint8_t rumble_right = ds5->rumble_right;
 
-                    // Calculate player LED from pattern (like DS3)
-                    // DS5 has separate player LED bar and RGB lightbar
+                    // Calculate player LED.
+                    //
+                    // Three cases for the host's player LED state:
+                    //   1. Host has explicitly set a pattern (led_dirty=true,
+                    //      pattern != 0): map that pattern through to the
+                    //      DS5's 5-LED bar layout. Latch host_set_player_led.
+                    //   2. Host has explicitly set pattern=0 (led_dirty=true,
+                    //      pattern == 0): user wants the LEDs off. Honor it.
+                    //      Latch host_set_player_led.
+                    //   3. Host hasn't spoken (led_dirty=false): two sub-cases.
+                    //      a. host_set_player_led is true → host has spoken
+                    //         in the past and we just don't have a fresh
+                    //         command. Hold the last value (no recompute).
+                    //      b. host_set_player_led is false → host has never
+                    //         spoken; show the player-index-derived default
+                    //         so the controller indicates its slot at idle.
                     uint8_t calc_player_led;
-                    if (fb->led.pattern != 0) {
-                        // Map feedback pattern to player number via PLAYER_LEDS[] lookup
-                        int player_num = 0;
-                        for (int p = 1; p <= 7; p++) {
-                            if (fb->led.pattern == PLAYER_LEDS[p]) {
-                                player_num = p - 1;
-                                break;
-                            }
-                        }
-                        int pat_idx = (player_num < 5) ? player_num : player_num % 5;
-                        calc_player_led = PLAYER_LED_PATTERNS[pat_idx];
-                    } else {
-                        // Default to player index
-                        int idx = (player_idx < 5) ? player_idx : player_idx % 5;
-                        calc_player_led = PLAYER_LED_PATTERNS[idx];
-                    }
-
-                    // Check if player LED changed
-                    if (calc_player_led != ds5->player_led) {
-                        player_led = calc_player_led;
-                        need_update = true;
-                    }
-
-                    // Check RGB lightbar from feedback
                     if (fb->led_dirty) {
-                        if (fb->led.r != 0 || fb->led.g != 0 || fb->led.b != 0) {
-                            // Host specified RGB color directly
-                            r = fb->led.r;
-                            g = fb->led.g;
-                            b = fb->led.b;
-                        } else if (fb->led.pattern != 0) {
-                            // Use player color based on pattern via PLAYER_LEDS[] lookup
+                        if (fb->led.pattern != 0) {
+                            // Map feedback pattern to player number via PLAYER_LEDS[] lookup
                             int player_num = 0;
                             for (int p = 1; p <= 7; p++) {
                                 if (fb->led.pattern == PLAYER_LEDS[p]) {
@@ -632,18 +628,48 @@ static void ds5_task(bthid_device_t* device)
                                     break;
                                 }
                             }
-                            int color_idx = (player_num < 7) ? player_num : player_num % 7;
-                            r = PLAYER_COLORS[color_idx][0];
-                            g = PLAYER_COLORS[color_idx][1];
-                            b = PLAYER_COLORS[color_idx][2];
+                            int pat_idx = (player_num < 5) ? player_num : player_num % 5;
+                            calc_player_led = PLAYER_LED_PATTERNS[pat_idx];
                         } else {
-                            // Default to player index color
-                            int idx = (player_idx < 7) ? player_idx : player_idx % 7;
-                            r = PLAYER_COLORS[idx][0];
-                            g = PLAYER_COLORS[idx][1];
-                            b = PLAYER_COLORS[idx][2];
+                            // Host requested all LEDs off.
+                            calc_player_led = 0;
                         }
+                        ds5->host_set_player_led = true;
+                    } else if (ds5->host_set_player_led) {
+                        // Host has spoken before. Hold the last value we
+                        // sent — don't recompute the default-from-index,
+                        // which would fight the host's last command and
+                        // re-light LEDs the host explicitly turned off.
+                        calc_player_led = ds5->player_led;
+                    } else {
+                        // Fresh state: no host command ever received.
+                        // Show the player-index-derived default so the
+                        // controller indicates its slot at idle.
+                        int idx = (player_idx < 5) ? player_idx : player_idx % 5;
+                        calc_player_led = PLAYER_LED_PATTERNS[idx];
+                    }
+
+                    // Check if player LED changed. Compare against the
+                    // cache (ds5->player_led) which tracks last-sent state.
+                    // The cache is updated below after ds5_send_output runs.
+                    if (calc_player_led != ds5->player_led) {
                         player_led = calc_player_led;
+                        need_update = true;
+                    }
+
+                    // Check RGB lightbar from feedback.
+                    //
+                    // When led_dirty is set, the host has issued an LED
+                    // command and we honor it verbatim — including RGB
+                    // (0,0,0) which means "lightbar off" (e.g., Steam
+                    // brightness slider at 0%). The previous code
+                    // interpreted (0,0,0) as "no host value, fall back
+                    // to player color," which prevented the user from
+                    // ever turning the lightbar off.
+                    if (fb->led_dirty) {
+                        r = fb->led.r;
+                        g = fb->led.g;
+                        b = fb->led.b;
                         need_update = true;
                     }
 
@@ -663,6 +689,19 @@ static void ds5_task(bthid_device_t* device)
 
                     if (need_update) {
                         ds5_send_output(device, rumble_left, rumble_right, r, g, b, player_led);
+                        // Update cache to reflect what we just sent. Without
+                        // this, the comparison at the top of the next pass
+                        // re-detects a "change" from stale cache to the same
+                        // current value, OR stale cache happens to match a
+                        // new desired value and gets skipped — both produce
+                        // inconsistent LED behavior across Steam's on/off
+                        // toggles.
+                        ds5->rumble_left = rumble_left;
+                        ds5->rumble_right = rumble_right;
+                        ds5->led_r = r;
+                        ds5->led_g = g;
+                        ds5->led_b = b;
+                        ds5->player_led = player_led;
                         feedback_clear_dirty(player_idx);
                     }
                 }

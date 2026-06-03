@@ -133,6 +133,7 @@ static bool xinput_mode_get_feedback(output_feedback_t* fb)
     fb->rumble_left = xinput_output.rumble_l;
     fb->rumble_right = xinput_output.rumble_r;
     fb->dirty = true;
+    fb->rumble_dirty = true;
     xinput_output_available = false;
     return true;
 }

@@ -56,6 +56,7 @@ extern int hid_get_ctrl_type(uint8_t dev_addr, uint8_t instance);
 #define SINPUT_TYPE_GAMECUBE     11
 #define SINPUT_TYPE_STEAM        12
 
+
 // ============================================================================
 // STATE
 // ============================================================================
@@ -75,6 +76,8 @@ static uint8_t cached_face_style = SINPUT_FACE_XBOX;
 static uint8_t cached_gamepad_type = SINPUT_TYPE_STANDARD;
 static bool cached_has_motion = false;
 static bool cached_has_touch = false;
+static bool cached_has_rgb_led = false;
+static bool cached_has_player_led = false;
 static controller_layout_t cached_layout = LAYOUT_UNKNOWN;  // last native layout (for feature refresh)
 static int16_t last_dev_addr = -1;  // Track connected device for auto feature report
 
@@ -373,6 +376,8 @@ static bool sinput_mode_send_report(uint8_t player_index,
     bool prev_touch = cached_has_touch;
     cached_has_motion = event->has_motion;
     cached_has_touch = event->has_touch;
+    cached_has_rgb_led = event->has_rgb_led;
+    cached_has_player_led = event->has_player_led;
 
     // Send feature report when device changes (new address, different type,
     // or capability change). BT controllers reuse conn_index slots, so
@@ -524,13 +529,13 @@ static void sinput_mode_handle_output(uint8_t report_id, const uint8_t* data, ui
             break;
 
         case SINPUT_CMD_PLAYER_LED:
-            // Player LED command: data[1] = player number (1-4)
+            // Player LED command: data[1] = player number (1-4), 0 = off.
+            // Always mark dirty: host's "set to 0" must propagate as
+            // "turn off" rather than be filtered out as no-change vs
+            // the initial value of 0.
             if (len >= 2) {
-                uint8_t new_led = data[1];
-                if (new_led != player_led) {
-                    player_led = new_led;
-                    player_led_dirty = true;
-                }
+                player_led = data[1];
+                player_led_dirty = true;
             }
             break;
 
@@ -540,14 +545,16 @@ static void sinput_mode_handle_output(uint8_t report_id, const uint8_t* data, ui
             break;
 
         case SINPUT_CMD_RGB_LED:
-            // RGB LED command: data[1] = R, data[2] = G, data[3] = B
+            // RGB LED command: data[1] = R, data[2] = G, data[3] = B.
+            // Always mark dirty when host sends the command — same-value
+            // commands are still intentional (e.g., host re-asserting
+            // off=(0,0,0) over our cached value). Downstream uses the
+            // dirty flag to distinguish intent from absence.
             if (len >= 4) {
-                if (data[1] != rgb_r || data[2] != rgb_g || data[3] != rgb_b) {
-                    rgb_r = data[1];
-                    rgb_g = data[2];
-                    rgb_b = data[3];
-                    rgb_dirty = true;
-                }
+                rgb_r = data[1];
+                rgb_g = data[2];
+                rgb_b = data[3];
+                rgb_dirty = true;
             }
             break;
 
@@ -573,6 +580,13 @@ static bool sinput_mode_get_feedback(output_feedback_t* fb)
     fb->led_r = rgb_r;
     fb->led_g = rgb_g;
     fb->led_b = rgb_b;
+
+    // Propagate per-field dirty so downstream apps can distinguish
+    // "host explicitly set 0" from "field not touched this call." The
+    // top-level `dirty` flag is the union (any field changed).
+    fb->rumble_dirty = rumble_dirty;
+    fb->player_led_dirty = player_led_dirty;
+    fb->rgb_dirty = rgb_dirty;
     fb->dirty = true;
 
     rumble_dirty = false;
@@ -617,6 +631,8 @@ static void sinput_mode_task(void)
         last_dev_addr = -1;
         cached_has_motion = false;
         cached_has_touch = false;
+        cached_has_rgb_led = false;
+        cached_has_player_led = false;
         cached_gamepad_type = SINPUT_TYPE_STANDARD;
         cached_face_style = SINPUT_FACE_XBOX;
         // Trigger re-enum directly here so the empty state propagates to
@@ -725,16 +741,28 @@ static void sinput_mode_task(void)
         //                     bit 4=LX/LY stick, bit 5=RX/RY stick,
         //                     bit 6=LT analog trigger, bit 7=RT analog trigger
         // SDL3's SInput driver reads stick/trigger presence from bits 4-7 here, not
-        // from the input report — without these set, Steam reports 0 axes.
-        f[2] = 0xF3;  // rumble + player LED + both sticks + both triggers
+        // from the input report — without these set, Steam reports 0 axes. Sticks
+        // and triggers are always advertised (every gamepad we support has them);
+        // rumble and player LED are gated on actual hardware capability so Steam
+        // doesn't surface configuration menus for controllers that can't honor them.
+        f[2] = 0xF1;  // bits 7,6,5,4 (sticks + triggers) + bit 0 (rumble, always on for now)
+        if (cached_has_player_led) {
+            f[2] |= 0x02;  // bit 1 = player LED supported
+        }
         if (cached_has_motion) {
             f[2] |= 0x0C;  // bit 2 = accel, bit 3 = gyro
         }
 
         // Capability flags 2: bit 0=touchpad, bit 1=RGB LED, bit 2=is_handheld
         // SDL3 gates touchpad processing on bit 0 — touchpad_count at byte 16 is
-        // ignored without it.
-        f[3] = 0x02;  // bit 1 = RGB LED always
+        // ignored without it. RGB LED bit is gated on the driver having declared
+        // host-configurable RGB output (DS4 lightbar, DS5 touchpad strip).
+        // Player-indicator LEDs that only show a player-number pattern are NOT
+        // RGB — those are covered by the player LED bit in f[2] above.
+        f[3] = 0x00;
+        if (cached_has_rgb_led) {
+            f[3] |= 0x02;  // bit 1 = RGB LED supported
+        }
         if (cached_has_touch) {
             f[3] |= 0x01;  // bit 0 = touchpad supported
         }

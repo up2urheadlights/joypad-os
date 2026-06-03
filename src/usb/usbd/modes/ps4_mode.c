@@ -172,6 +172,8 @@ static bool ps4_mode_get_feedback(output_feedback_t* fb)
     fb->led_b = ps4_output.lightbar_blue;
 
     fb->dirty = true;
+    fb->rumble_dirty = true;
+    fb->rgb_dirty = true;
     ps4_output_available = false;
     return true;
 }

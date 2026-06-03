@@ -759,19 +759,24 @@ void app_task(void)
     cyw43_led_update(devices);
 #endif
 
-    // Route feedback from USB device output to USB host input controllers
-    // The output interface receives rumble/LED from the console/host
-    // and we forward it to connected controllers via the feedback system
+    // Route feedback from USB device output to USB host input controllers.
+    // Mirror of the BT2USB version. Untested on hardware: requires USB host
+    // breakout to verify; the logic is identical to bt2usb's and the
+    // contract change (output_feedback_t per-field dirty) is symmetric, so
+    // behavior is expected to match.
     if (usbd_output_interface.get_feedback) {
         output_feedback_t fb;
+        memset(&fb, 0, sizeof(fb));
         if (usbd_output_interface.get_feedback(&fb)) {
             // Set feedback for all active players
             for (int i = 0; i < playersCount; i++) {
-                feedback_set_rumble(i, fb.rumble_left, fb.rumble_right);
-                if (fb.led_player > 0) {
+                if (fb.rumble_dirty) {
+                    feedback_set_rumble(i, fb.rumble_left, fb.rumble_right);
+                }
+                if (fb.player_led_dirty) {
                     feedback_set_led_player(i, fb.led_player);
                 }
-                if (fb.led_r || fb.led_g || fb.led_b) {
+                if (fb.rgb_dirty) {
                     feedback_set_led_rgb(i, fb.led_r, fb.led_g, fb.led_b);
                 }
             }
@@ -816,6 +821,7 @@ void app_task(void)
         // Feedback (rumble, LEDs)
         if (usbd_output_interface.get_feedback) {
             output_feedback_t fb;
+            memset(&fb, 0, sizeof(fb));
             if (usbd_output_interface.get_feedback(&fb)) {
                 status.rumble_left = fb.rumble_left;
                 status.rumble_right = fb.rumble_right;
