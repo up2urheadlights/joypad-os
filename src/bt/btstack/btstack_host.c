@@ -3843,6 +3843,11 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                         printf("[BTSTACK_HOST] Set VID=0x%04X from %s profile\n",
                                conn->vendor_id, conn->profile->name);
                     }
+                    if (conn->product_id == 0 && conn->profile && conn->profile->default_pid) {
+                        conn->product_id = conn->profile->default_pid;
+                        printf("[BTSTACK_HOST] Set PID=0x%04X from %s profile\n",
+                               conn->product_id, conn->profile->name);
+                    }
 
                     // Non-Wiimote: wait for HID_SUBEVENT_DESCRIPTOR_AVAILABLE
                     // NOTE: Do NOT issue SDP queries here — BTstack HID Host starts its
@@ -3948,6 +3953,14 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
             hid_protocol_mode_t mode = hid_subevent_set_protocol_response_get_protocol_mode(packet);
             printf("[BTSTACK_HOST] HID set protocol response: cid=0x%04X handshake=%d mode=%d\n",
                    hid_cid, handshake, mode);
+            break;
+        }
+
+        case HID_SUBEVENT_SET_REPORT_RESPONSE: {
+            uint16_t hid_cid = hid_subevent_set_report_response_get_hid_cid(packet);
+            uint8_t handshake = hid_subevent_set_report_response_get_handshake_status(packet);
+            printf("[BTSTACK_HOST] HID set report response: cid=0x%04X handshake=%d\n",
+                   hid_cid, handshake);
             break;
         }
 
@@ -4151,8 +4164,8 @@ bool btstack_classic_send_set_report_type(uint8_t conn_index, uint8_t report_typ
 
     uint8_t status = hid_host_send_set_report(conn->hid_cid, hid_type, report_id, hid_host_set_report_buf, len);
     if (status != ERROR_CODE_SUCCESS) {
-        printf("[BTSTACK_HOST] send_set_report failed: type=%d id=0x%02X status=%d\n",
-               report_type, report_id, status);
+        printf("[BTSTACK_HOST] send_set_report failed: cid=0x%04X type=%d id=0x%02X status=%d\n",
+               conn->hid_cid, report_type, report_id, status);
     }
     return status == ERROR_CODE_SUCCESS;
 }

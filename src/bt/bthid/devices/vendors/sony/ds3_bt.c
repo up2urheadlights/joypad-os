@@ -96,6 +96,12 @@ typedef struct {
     bool initialized;
     input_event_t event;
     uint8_t player_led;
+    // Sticky flag: set when the host has explicitly commanded LEDs off
+    // (SINPUT_CMD_PLAYER_LED with player=0). Without this, the LED-off
+    // command turns LEDs off briefly but the very next state-3 task tick
+    // falls back to the player-index default and turns LEDs back on.
+    // Cleared when the host commands a non-zero player number again.
+    bool host_led_off_sticky;
     uint8_t activation_state;  // 0=idle, 1=enabled, 2=activated
     uint32_t activation_time;  // Time of last state change
 } ds3_bt_data_t;
@@ -157,12 +163,30 @@ static bool ds3_init(bthid_device_t* device)
             ds3_data[i].activation_state = 0;
             ds3_data[i].activation_time = 0;
             ds3_data[i].player_led = 0;
+            ds3_data[i].host_led_off_sticky = false;
 
             ds3_data[i].event.type = INPUT_TYPE_GAMEPAD;
             ds3_data[i].event.transport = INPUT_TRANSPORT_BT_CLASSIC;
             ds3_data[i].event.dev_addr = device->conn_index;
             ds3_data[i].event.instance = 0;
-            ds3_data[i].event.button_count = 10;
+            // Parity with DS4/DS5 driver: 14 covers all DS3 face/shoulder/
+            // stick-click/system buttons. Previous value of 10 hid L3/R3
+            // from Steam's button visualization.
+            ds3_data[i].event.button_count = 14;
+
+            // Hardware capability declarations (used by sinput features-
+            // response so host shows the right configuration menus):
+            //   - SIXAXIS: 3-axis accel + single-axis (Z/yaw) gyro. We
+            //     advertise has_motion=true; per-axis filtering (DS3 has
+            //     only one gyro axis) is IMU-PR scope.
+            //   - No touchpad.
+            //   - Player LEDs (4 indicator LEDs on the front, controlled
+            //     via the LED bitmap in the output report).
+            //   - No host-configurable RGB.
+            ds3_data[i].event.has_motion = true;
+            ds3_data[i].event.has_touch = false;
+            ds3_data[i].event.has_rgb_led = false;
+            ds3_data[i].event.has_player_led = true;
 
             device->driver_data = &ds3_data[i];
             printf("[DS3_BT] Init complete, slot %d, driver_data=%p\n", i, device->driver_data);
@@ -178,8 +202,59 @@ static bool ds3_init(bthid_device_t* device)
     return false;
 }
 
-// Send LED/rumble output report to DS3
-static void ds3_send_output(bthid_device_t* device, uint8_t leds, uint8_t rumble_left, uint8_t rumble_right)
+// DS3 BT output rate control (per Nefarius DsHidMini docs):
+//
+// Certain SIXAXIS/DualShock 3 revisions enter a "packet flood lockup"
+// state when output reports arrive faster than ~150 ms apart. Symptoms
+// per Nefarius documentation: "not responding to rumble request or LED
+// state changes for a few seconds or sometimes even until it is power-
+// cycled." Observable upstream symptom in our BTstack logs is status=12
+// (COMMAND_DISALLOWED) returned from send_set_report when the controller
+// hasn't acknowledged the previous packet.
+//
+// Reference:
+// https://docs.nefarius.at/projects/DsHidMini/v3/Output-Rate-Control-Explained/
+//
+// Algorithm (matches DsHidMini's documented "replace-latest" pattern,
+// reportedly fixes ~99.9% of lockup issues):
+//
+//   - When ds3_send_output is called and the throttle window is open
+//     (>= 150 ms since last send), transmit immediately.
+//   - When the window is closed (< 150 ms), stash the requested
+//     {leds, rumble_L, rumble_R} in a "pending" slot. Any previously
+//     pending slot is overwritten — newest wins. This is the key
+//     property: a user's "LED off" command issued during the window
+//     replaces an earlier slot-indicator re-send, so the off command
+//     can't be lost behind stale state.
+//   - The task loop calls ds3_flush_pending_output every tick. Once
+//     the window elapses, it transmits the pending slot (if any) and
+//     clears it.
+//
+// Caller contract: ds3_send_output never fails from the caller's
+// perspective. Callers always update their cache after calling it;
+// the rate-control layer guarantees the latest commanded state will
+// reach the controller within ~150 ms.
+//
+// Limitations: single pending slot is shared across all DS3 instances
+// (singleton scope). joypad-os currently supports one DS3 connection
+// at a time so this is benign; if multi-DS3 support is ever added,
+// this should move into ds3_bt_data_t.
+#define DS3_OUTPUT_MIN_GAP_MS 150
+
+static uint32_t ds3_last_output_send_time_ms = 0;
+static bool ds3_pending_set = false;
+static uint8_t ds3_pending_leds = 0;
+static uint8_t ds3_pending_rumble_left = 0;
+static uint8_t ds3_pending_rumble_right = 0;
+
+// Internal: build the output report buffer and hand it to BTstack.
+// Returns whatever bt_send_control returns (true if BTstack accepted
+// the packet for transmission; false if BTstack itself rejected it,
+// usually because a previous packet is still queued at the L2CAP layer).
+static bool ds3_transmit_output(bthid_device_t* device,
+                                uint8_t leds,
+                                uint8_t rumble_left,
+                                uint8_t rumble_right)
 {
     // Static: BTstack stores pointer to report data for deferred L2CAP send
     static ds3_bt_output_report_t report;
@@ -198,10 +273,32 @@ static void ds3_send_output(bthid_device_t* device, uint8_t leds, uint8_t rumble
         report.rumble_left_force = rumble_left;
     }
 
-    // LEDs (bits 1-4)
+    // LEDs (bits 1-4 = LED 1-4)
+    //
+    // When the host commands all LEDs off (incoming `leds` parameter is 0),
+    // set bit 5 (0x20) in the bitmap. Linux kernel hid-sony.c
+    // (sixaxis_send_output_report) does this for the SIXAXIS family:
+    //
+    //   /* Set flag for all leds off, required for 3rd party INTEC controller */
+    //   if ((report->leds_bitmap & 0x1E) == 0)
+    //       report->leds_bitmap |= 0x20;
+    //
+    // DsHidMini's driver/Ds3.h defines DS3_LED_OFF as 0x20 and uses it
+    // for "all off" in its own LED control paths (driver/Device.c:597,
+    // driver/HID.Reports.c:438). USB_Host_Shield_2.0's PS3BT::setAllOff()
+    // alternately sets the byte to bare 0x00 and that also works on
+    // genuine Sony DS3 controllers. We use the 0x20 form for defense
+    // in depth (covers third-party clones like INTEC).
     report.leds_bitmap = leds;
+    if ((report.leds_bitmap & 0x1E) == 0) {
+        report.leds_bitmap |= 0x20;
+    }
 
-    // LED PWM settings for constant on (matches PS3_REPORT_BUFFER)
+    // LED PWM settings — the 4-entry PWM array tells DS3 how each LED slot
+    // behaves when the corresponding leds_bitmap bit is set: time_enabled=
+    // 0xFF (full on), duty_length=0x27, enabled=0x10 (PWM enabled, ~constant
+    // on), duty_off=0x00, duty_on=0x32. Matches PS3_REPORT_BUFFER pattern
+    // also used by BlueRetro's working PS3 implementation.
     for (int i = 0; i < 4; i++) {
         report.led[i].time_enabled = 0xFF;
         report.led[i].duty_length = 0x27;
@@ -210,13 +307,64 @@ static void ds3_send_output(bthid_device_t* device, uint8_t leds, uint8_t rumble
         report.led[i].duty_on = 0x32;
     }
 
-    printf("[DS3_BT] Sending output report (%d bytes) to conn %d\n", (int)sizeof(report), device->conn_index);
-
-    // Send via control channel
-    bt_send_control(device->conn_index, (uint8_t*)&report, sizeof(report));
+    bool ok = bt_send_control(device->conn_index, (uint8_t*)&report, sizeof(report));
+    if (ok) {
+        ds3_last_output_send_time_ms = platform_time_ms();
+    }
+    return ok;
 }
 
-static bool ds3_report_debug_done = false;
+// Public: enqueue an output report. Always succeeds from the caller's
+// perspective. If the throttle window is closed, the request is stashed
+// for later transmission by ds3_flush_pending_output (newest-wins). The
+// caller may freely update its cache after this returns.
+static void ds3_send_output(bthid_device_t* device,
+                            uint8_t leds,
+                            uint8_t rumble_left,
+                            uint8_t rumble_right)
+{
+    uint32_t now_ms = platform_time_ms();
+    bool window_open = (ds3_last_output_send_time_ms == 0) ||
+                       ((now_ms - ds3_last_output_send_time_ms) >= DS3_OUTPUT_MIN_GAP_MS);
+
+    if (window_open) {
+        // Try immediate transmit. If BTstack rejects (still has prior
+        // packet queued at the L2CAP layer), fall through to pending.
+        if (ds3_transmit_output(device, leds, rumble_left, rumble_right)) {
+            return;
+        }
+    }
+
+    // Throttled, or immediate send failed: replace any prior pending
+    // request with this one. Newest wins — a user's "LED off" command
+    // is never lost behind an earlier slot-indicator re-send.
+    ds3_pending_leds = leds;
+    ds3_pending_rumble_left = rumble_left;
+    ds3_pending_rumble_right = rumble_right;
+    ds3_pending_set = true;
+}
+
+// Called every task tick to drain the pending slot once the throttle
+// window reopens. If no pending request, no-op.
+static void ds3_flush_pending_output(bthid_device_t* device)
+{
+    if (!ds3_pending_set) {
+        return;
+    }
+    uint32_t now_ms = platform_time_ms();
+    if (ds3_last_output_send_time_ms != 0 &&
+        (now_ms - ds3_last_output_send_time_ms) < DS3_OUTPUT_MIN_GAP_MS) {
+        return;  // still in throttle window
+    }
+    if (ds3_transmit_output(device,
+                            ds3_pending_leds,
+                            ds3_pending_rumble_left,
+                            ds3_pending_rumble_right)) {
+        ds3_pending_set = false;
+    }
+    // If transmit failed (BTstack still busy), leave pending set; next
+    // tick will retry.
+}
 
 static void ds3_process_report(bthid_device_t* device, const uint8_t* data, uint16_t len)
 {
@@ -239,20 +387,15 @@ static void ds3_process_report(bthid_device_t* device, const uint8_t* data, uint
     len -= 1;
 
     if (len < sizeof(ds3_bt_input_report_t)) {
-        if (!ds3_report_debug_done) {
+        static bool size_warning_done = false;
+        if (!size_warning_done) {
             printf("[DS3_BT] Report too small: %d < %d\n", len, (int)sizeof(ds3_bt_input_report_t));
-            ds3_report_debug_done = true;
+            size_warning_done = true;
         }
         return;
     }
 
     const ds3_bt_input_report_t* rpt = (const ds3_bt_input_report_t*)data;
-
-    if (!ds3_report_debug_done) {
-        printf("[DS3_BT] Processing report, buttons: %02X %02X\n",
-               ((uint8_t*)rpt)[1], ((uint8_t*)rpt)[2]);
-        ds3_report_debug_done = true;
-    }
 
     // Build button state
     uint32_t buttons = 0;
@@ -392,8 +535,6 @@ static void ds3_disconnect(bthid_device_t* device)
     }
 }
 
-static bool ds3_task_debug_done = false;
-
 // Send the enable_sixaxis command to activate input reporting
 static void ds3_enable_sixaxis(bthid_device_t* device)
 {
@@ -412,65 +553,110 @@ static void ds3_enable_sixaxis(bthid_device_t* device)
 
 static void ds3_task(bthid_device_t* device)
 {
-    if (!ds3_task_debug_done) {
-        printf("[DS3_BT] Task called, driver_data=%p\n", device->driver_data);
-        ds3_task_debug_done = true;
-    }
-
     ds3_bt_data_t* ds3 = (ds3_bt_data_t*)device->driver_data;
     if (!ds3) return;
 
     uint32_t now = platform_time_ms();
 
-    // State machine for activation with delays
+    // State machine for activation with delays.
+    //
+    // DS3 over BT has surprisingly strict timing requirements relative to
+    // BTstack's HID host setup:
+    //
+    //   1. BTstack issues SET_PROTOCOL after the HID connection opens. DS3
+    //      doesn't support SET_PROTOCOL and returns handshake=3
+    //      (ERR_UNSUPPORTED_REQUEST). If we send our 0xF4 enable while
+    //      DS3 is dealing with this rejected SET_PROTOCOL, DS3 responds to
+    //      0xF4 with handshake=1 (NOT_READY) and never starts streaming.
+    //
+    //   2. After 0xF4 is finally accepted, DS3 needs another ~1 second
+    //      before it'll process the LED/rumble config report. BlueRetro's
+    //      reference implementation uses a 1-second post-enable delay for
+    //      this reason (main/bluetooth/hidp/ps3.c, bt_hid_ps3_init).
+    //
+    // States:
+    //   0 = wait ~1s for BTstack's SET_PROTOCOL to complete and DS3 to settle
+    //   1 = send 0xF4 enable
+    //   2 = wait ~1s for DS3 to be ready for output config, then send LED
+    //   3 = activated, monitor feedback for LED/rumble changes
     switch (ds3->activation_state) {
-        case 0:  // Send enable_sixaxis
-            printf("[DS3_BT] Sending enable_sixaxis command\n");
-            ds3_enable_sixaxis(device);
-            ds3->activation_state = 1;
-            ds3->activation_time = now;
-            break;
-
-        case 1:  // Wait 150ms then send LED
-            if (now - ds3->activation_time >= 150) {
-                printf("[DS3_BT] Sending LED command\n");
-                ds3_send_output(device, 0x02, 0, 0);  // LED 1 = bit 1
-                ds3->player_led = 0x02;
-                ds3->activation_state = 2;
+        case 0:  // Initialize wait timer, then wait for BTstack to settle
+            if (ds3->activation_time == 0) {
+                ds3->activation_time = now;
+            }
+            if (now - ds3->activation_time >= 1000) {
+                ds3->activation_state = 1;
             }
             break;
 
-        case 2:  // Activated - monitor player LED and rumble from feedback system
+        case 1:  // Send enable_sixaxis
+            printf("[DS3_BT] Sending enable_sixaxis command\n");
+            ds3_enable_sixaxis(device);
+            ds3->activation_state = 2;
+            ds3->activation_time = now;
+            break;
+
+        case 2:  // Wait then send LED
+            // Per BlueRetro reference (bt_hid_ps3_init): DS3 isn't ready to
+            // receive output config immediately after the 0xF4 enable.
+            //
+            // ds3_send_output never fails from the caller's view — if the
+            // throttle window is closed, it stashes the request and the
+            // rate-control layer transmits when the window reopens. So we
+            // can unconditionally advance state.
+            if (now - ds3->activation_time >= 1000) {
+                printf("[DS3_BT] Sending LED command\n");
+                ds3_send_output(device, 0x02, 0, 0);  // LED 1 = bit 1
+                ds3->player_led = 0x02;
+                ds3->activation_state = 3;
+            }
+            break;
+
+        case 3:  // Activated - monitor player LED and rumble from feedback system
             {
+                // Drain any pending output stashed during the throttle
+                // window. Cheap if nothing pending.
+                ds3_flush_pending_output(device);
+
                 int player_idx = find_player_index(ds3->event.dev_addr, ds3->event.instance);
                 if (player_idx >= 0) {
                     feedback_state_t* fb = feedback_get_state(player_idx);
-                    bool need_update = false;
 
-                    // Check LED from feedback system
-                    // Feedback pattern: bits 0-3 for players 1-4 (0x01, 0x02, 0x04, 0x08)
-                    // DS3 LED bitmap: bits 1-4 for LEDs 1-4 (0x02, 0x04, 0x08, 0x10)
-                    // Conversion: shift left by 1
+                    // LED resolution:
+                    // - When host explicitly commands pattern=0 with dirty
+                    //   set, latch host_led_off_sticky=true so subsequent
+                    //   ticks don't fall back to the player-index default.
+                    //   Without the latch, the LED turns off briefly then
+                    //   immediately comes back on.
+                    // - When host commands a non-zero pattern with dirty
+                    //   set, clear the latch and honor the new pattern.
+                    // - When host hasn't commanded anything (not dirty),
+                    //   either respect the off-latch or use the player-
+                    //   index default.
+                    // DS3 LED bitmap uses bits 1-4 (0x02, 0x04, 0x08, 0x10);
+                    // the feedback layer uses bits 0-3, so we shift left by 1.
+                    if (fb->led_dirty) {
+                        ds3->host_led_off_sticky = (fb->led.pattern == 0);
+                    }
                     uint8_t led;
-                    if (fb->led.pattern != 0) {
-                        // Use LED from host/feedback system
+                    if (ds3->host_led_off_sticky) {
+                        led = 0;
+                    } else if (fb->led.pattern != 0) {
                         led = fb->led.pattern << 1;
                     } else {
-                        // Default to player index-based LED
                         led = PLAYER_LEDS[player_idx + 1] << 1;
                     }
-                    if (fb->led_dirty || led != ds3->player_led) {
+                    bool led_changed = (fb->led_dirty || led != ds3->player_led);
+
+                    if (led_changed || fb->rumble_dirty) {
+                        // ds3_send_output never fails from the caller's view:
+                        // if the throttle window is closed, the request is
+                        // stashed and ds3_flush_pending_output transmits it
+                        // when the window reopens. Always update cache and
+                        // clear dirty — newest-wins guarantees the latest
+                        // commanded state reaches the controller.
+                        ds3_send_output(device, led, fb->rumble.left, fb->rumble.right);
                         ds3->player_led = led;
-                        need_update = true;
-                    }
-
-                    // Check rumble
-                    if (fb->rumble_dirty) {
-                        need_update = true;
-                    }
-
-                    if (need_update) {
-                        ds3_send_output(device, ds3->player_led, fb->rumble.left, fb->rumble.right);
                         feedback_clear_dirty(player_idx);
                     }
                 }

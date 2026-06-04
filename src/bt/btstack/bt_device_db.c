@@ -55,6 +55,7 @@ const bt_device_profile_t BT_PROFILE_DS3 = {
     .pin_type = BT_PIN_NONE,
     .classic_only = true,
     .default_vid = 0x054C,
+    .default_pid = 0x0268,
 };
 
 const bt_device_profile_t BT_PROFILE_SONY = {
