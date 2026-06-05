@@ -157,6 +157,12 @@ typedef struct {
     wiimote_ext_type_t ext_type;
     bool extension_connected;
     uint8_t player_led;
+    // Sticky flag: set when the host has explicitly commanded LEDs off
+    // (SINPUT_CMD_PLAYER_LED with player=0). Without this, the LED-off
+    // command turns LEDs off briefly but the next state-READY task tick
+    // falls back to the player-index default and turns LEDs back on.
+    // Cleared when the host commands a non-zero player number again.
+    bool host_led_off_sticky;
     bool rumble_on;
     wiimote_orient_t orientation;
     bool orient_hotkey_active;  // Prevent repeated hotkey triggers
@@ -332,6 +338,26 @@ static bool wiimote_init(bthid_device_t* device)
             wiimote_data[i].event.dev_addr = device->conn_index;
             wiimote_data[i].event.instance = 0;
             wiimote_data[i].event.button_count = 11;  // Wiimote has fewer buttons
+
+            // Hardware capability declarations (used by sinput features-
+            // response so host shows the right configuration menus):
+            //   - The Wiimote has a 3-axis accelerometer and an IR
+            //     sensor, plus an optional MotionPlus accessory for a
+            //     gyro. None of this motion data is currently plumbed
+            //     through to the sinput output; has_motion stays false
+            //     until that lands as a separate change. The IMU PR
+            //     would cover Wiimote motion at the same time as
+            //     Switch Pro / Joy-Con / Pro 2 motion.
+            //   - The IR sensor is a 4-blob pointer, not a touchpad.
+            //   - No host-configurable RGB.
+            //   - 4 player-indicator LEDs (1-4 lit pattern via Wiimote
+            //     output report 0x11).
+            wiimote_data[i].event.has_motion = false;
+            wiimote_data[i].event.has_touch = false;
+            wiimote_data[i].event.has_rgb_led = false;
+            wiimote_data[i].event.has_player_led = true;
+
+            wiimote_data[i].host_led_off_sticky = false;
             wiimote_data[i].ext_type = WII_EXT_NONE;
             wiimote_data[i].extension_connected = false;
 
@@ -853,12 +879,25 @@ static void wiimote_task(bthid_device_t* device)
                         }
                     }
 
-                    // Check LED from feedback system
+                    // LED resolution:
+                    // - When host explicitly commands pattern=0 with dirty
+                    //   set, latch host_led_off_sticky=true so subsequent
+                    //   ticks don't fall back to the player-index default.
+                    // - When host commands a non-zero pattern with dirty
+                    //   set, clear the latch and honor the new pattern.
+                    // - When host hasn't commanded anything (not dirty),
+                    //   either respect the off-latch or use the player-
+                    //   index default.
                     // Feedback pattern: bits 0-3 for players 1-4 (0x01, 0x02, 0x04, 0x08)
                     // Wiimote LED: bits 4-7 for LEDs 1-4 (0x10, 0x20, 0x40, 0x80)
-                    // Conversion: shift left by 4
+                    // Conversion: shift left by 4.
+                    if (fb->led_dirty) {
+                        wii->host_led_off_sticky = (fb->led.pattern == 0);
+                    }
                     uint8_t led;
-                    if (fb->led.pattern != 0) {
+                    if (wii->host_led_off_sticky) {
+                        led = 0;
+                    } else if (fb->led.pattern != 0) {
                         led = fb->led.pattern << 4;
                     } else {
                         led = PLAYER_LEDS[player_idx + 1] << 4;

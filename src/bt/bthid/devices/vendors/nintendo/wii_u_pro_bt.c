@@ -31,7 +31,23 @@
 // ============================================================================
 
 // Button bits (after inverting - buttons report 0 when pressed)
-// Derived from USB Host Shield WII_PROCONTROLLER_BUTTONS
+// Derived from USB Host Shield WII_PROCONTROLLER_BUTTONS.
+//
+// Authoritative reference:
+// https://wiiubrew.org/wiki/Pro_Controller (Data Format section)
+//
+// NOTE: The Wii U Pro Controller has a physical Power button on the
+// hardware, but it is NOT reported via the BT input report. WiiUBrew's
+// data format documentation accounts for every bit of every byte in
+// the report and no Power bit exists — bytes 8-10 contain the 17
+// button bits enumerated below plus battery/charging/wired status
+// flags, with no slot for Power. The controller's internal MCU
+// handles the Power button locally: long-press triggers BT
+// disconnect/sleep, short-press is consumed internally with no host
+// notification. USB_Host_Shield_2.0, BlueRetro, DsHidMini, and
+// Dolphin all confirm this — none expose a Power button event for
+// this device. button_count=14 in the init block is intentional;
+// raising it cannot surface a button that isn't transmitted.
 #define WIIU_BTN_R      0x00002
 #define WIIU_BTN_PLUS   0x00004
 #define WIIU_BTN_HOME   0x00008
@@ -97,6 +113,12 @@ typedef struct {
     input_event_t event;
     bool initialized;
     uint8_t player_led;
+    // Sticky flag: set when the host has explicitly commanded LEDs off
+    // (SINPUT_CMD_PLAYER_LED with player=0). Without this, the LED-off
+    // command turns LEDs off briefly but the very next state-3 task tick
+    // falls back to the player-index default and turns LEDs back on.
+    // Cleared when the host commands a non-zero player number again.
+    bool host_led_off_sticky;
     bool rumble_on;
     wii_u_state_t state;
     uint32_t init_time;         // Time when we should try init
@@ -264,12 +286,29 @@ static bool wii_u_init(bthid_device_t* device)
             init_input_event(&wii_u_data[i].event);
             wii_u_data[i].initialized = true;
             wii_u_data[i].player_led = 0;
+            wii_u_data[i].host_led_off_sticky = false;
 
             wii_u_data[i].event.type = INPUT_TYPE_GAMEPAD;
             wii_u_data[i].event.transport = INPUT_TRANSPORT_BT_CLASSIC;
             wii_u_data[i].event.dev_addr = device->conn_index;
             wii_u_data[i].event.instance = 0;
             wii_u_data[i].event.button_count = 14;
+
+            // Hardware capability declarations (used by sinput features-
+            // response so host shows the right configuration menus):
+            //   - No motion sensors. Wii U Pro Controller has no
+            //     accelerometer or gyro — that's the Wiimote (with
+            //     optional MotionPlus) and Wii MotionPlus accessory
+            //     territory, not the Pro controller.
+            //   - No touchpad.
+            //   - Player LEDs (4 indicator LEDs on the front, controlled
+            //     via the Wiimote 0x11 output report with the player bits
+            //     in the high nibble).
+            //   - No host-configurable RGB.
+            wii_u_data[i].event.has_motion = false;
+            wii_u_data[i].event.has_touch = false;
+            wii_u_data[i].event.has_rgb_led = false;
+            wii_u_data[i].event.has_player_led = true;
 
             // Ensure VID/PID are set (Wiimote-family lacks PnP SDP)
             if (device->vendor_id == 0) device->vendor_id = 0x057E;
@@ -768,21 +807,44 @@ static void wii_u_task(bthid_device_t* device)
                         }
                     }
 
-                    // Check LED from feedback system
+                    // LED resolution:
+                    // - When host explicitly commands pattern=0 with dirty
+                    //   set, latch host_led_off_sticky=true so subsequent
+                    //   ticks don't fall back to the player-index default.
+                    //   Without the latch, the LED turns off briefly then
+                    //   immediately comes back on.
+                    // - When host commands a non-zero pattern with dirty
+                    //   set, clear the latch and honor the new pattern.
+                    // - When host hasn't commanded anything (not dirty),
+                    //   either respect the off-latch or use the player-
+                    //   index default.
                     // Feedback pattern: bits 0-3 for players 1-4 (0x01, 0x02, 0x04, 0x08)
                     // Wii U Pro LED: bits 4-7 for LEDs 1-4 (0x10, 0x20, 0x40, 0x80)
-                    // Conversion: shift left by 4
+                    // Conversion: shift left by 4.
+                    if (fb->led_dirty) {
+                        wii->host_led_off_sticky = (fb->led.pattern == 0);
+                    }
                     uint8_t led;
-                    if (fb->led.pattern != 0) {
-                        // Use LED from host/feedback system
+                    if (wii->host_led_off_sticky) {
+                        led = 0;
+                    } else if (fb->led.pattern != 0) {
                         led = fb->led.pattern << 4;
                     } else {
-                        // Default to player index-based LED
                         led = PLAYER_LEDS[player_idx + 1] << 4;
                     }
 
                     if (fb->led_dirty || led != wii->player_led) {
                         if (btstack_wiimote_can_send(device->conn_index)) {
+                            // DIAG: trace every actual LED transmission so we
+                            // can diagnose the brief blink reported on
+                            // host-toggle (on->off and off->on). Shows what
+                            // bytes go out and what state we believed when
+                            // we sent them. Strip once diagnosed.
+                            printf("[WIIU-LED] sending raw=0x%02X (was cached 0x%02X) "
+                                   "fb.pattern=0x%02X fb.led_dirty=%d sticky=%d\n",
+                                   (int)led, (int)wii->player_led,
+                                   (int)fb->led.pattern, (int)fb->led_dirty,
+                                   (int)wii->host_led_off_sticky);
                             wii->player_led = led;
                             wii_u_set_leds_raw(device, led);
                         }
